@@ -8,19 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
-)
-
-// ProcessState represents the current state of a subprocess
-type ProcessState int32
-
-const (
-	StateNotStarted ProcessState = iota
-	StateRunning
-	StateStopped
-	StateFailed
-	StateRestarting
 )
 
 // RestartPolicy defines how a process should be restarted
@@ -52,15 +41,24 @@ type Config struct {
 	MaxRestarts   int           // Maximum number of restarts (0 = unlimited)
 	RestartDelay  time.Duration // Delay between restarts
 	StopTimeout   time.Duration // Timeout for graceful shutdown
+	StopSignal    os.Signal     // Signal to send for graceful shutdown (default: SIGINT)
 
 	// Event callbacks
-	OnStateChange func(old, new ProcessState)
-	OnRestart     func(count int)
-	OnError       func(error)
+	OnRestart func(count int)
+	OnError   func(error)
 }
 
-// SetDefaults sets default values for unset configuration options
-func (c *Config) SetDefaults() {
+// Process represents a managed subprocess
+type Process struct {
+	config       *Config
+	cmd          *exec.Cmd
+	restartCount int
+	done         chan struct{}
+	lastError    error
+}
+
+// New creates a new managed process
+func New(c *Config) *Process {
 	if c.Stdin == nil {
 		c.Stdin = os.Stdin
 	}
@@ -71,112 +69,79 @@ func (c *Config) SetDefaults() {
 		c.Stderr = os.Stderr
 	}
 	if c.RestartDelay == 0 {
-		c.RestartDelay = 5 * time.Second
+		c.RestartDelay = 1 * time.Second
 	}
 	if c.StopTimeout == 0 {
 		c.StopTimeout = 10 * time.Second
 	}
-}
-
-// Process represents a managed subprocess
-type Process struct {
-	config       *Config
-	cmd          *exec.Cmd
-	state        atomic.Value // ProcessState
-	restartCount int
-	mu           sync.RWMutex
-	ctx          context.Context
-	cancel       context.CancelFunc
-	done         chan struct{}
-	lastError    error
-	startTime    time.Time
-}
-
-// New creates a new managed process
-func New(config *Config) *Process {
-	config.SetDefaults()
+	if c.StopSignal == nil {
+		c.StopSignal = syscall.SIGINT
+	}
 
 	p := &Process{
-		config: config,
+		config: c,
 		done:   make(chan struct{}),
 	}
-	p.setState(StateNotStarted)
 	return p
 }
 
 // Start starts the process with automatic restart capability
-func (p *Process) Start(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.getState() == StateRunning {
-		return fmt.Errorf("process is already running")
-	}
-
-	p.ctx, p.cancel = context.WithCancel(ctx)
-
-	go p.supervise()
-
-	return nil
+func (p *Process) Start(ctx context.Context) {
+	go p.supervise(ctx)
 }
 
-// supervise manages the process lifecycle including restarts
-func (p *Process) supervise() {
+// supervise manages the process lifecycle
+func (p *Process) supervise(ctx context.Context) {
 	defer close(p.done)
-
 	for {
+		err := p.runProcess(ctx)
+
+		// Check context cancellation
 		select {
-		case <-p.ctx.Done():
-			p.stopProcess()
+		case <-ctx.Done():
+			// Context is cancelled, do not restart
 			return
 		default:
-			// Start the process
-			err := p.runProcess()
+		}
 
-			// Check if we should restart
-			if !p.shouldRestart(err) {
-				return
-			}
+		// Check if we should restart
+		if !p.shouldRestart(err) {
+			return
+		}
 
+		// Wait before restarting
+		select {
+		case <-time.After(p.config.RestartDelay):
 			// Increment restart counter
-			p.mu.Lock()
 			p.restartCount++
 			restartCount := p.restartCount
-			p.mu.Unlock()
 
-			p.setState(StateRestarting)
 			if p.config.OnRestart != nil {
 				p.config.OnRestart(restartCount)
 			}
-
-			// Wait before restarting
-			select {
-			case <-time.After(p.config.RestartDelay):
-				continue
-			case <-p.ctx.Done():
-				return
-			}
+		case <-ctx.Done():
+			// Check context cancellation
+			return
 		}
 	}
 }
 
 // runProcess executes the actual subprocess
-func (p *Process) runProcess() error {
-	p.mu.Lock()
-	p.cmd = exec.CommandContext(p.ctx, p.config.Command, p.config.Args...)
+func (p *Process) runProcess(ctx context.Context) error {
+	p.cmd = exec.Command(p.config.Command, p.config.Args...)
 	p.cmd.Dir = p.config.Dir
 	p.cmd.Env = p.config.Env
 	p.cmd.Stdin = p.config.Stdin
-	p.startTime = time.Now()
-	p.mu.Unlock()
 
 	// Setup stdout/stderr pipes
 	stdout, err := p.cmd.StdoutPipe()
+	defer stdout.Close()
 	if err != nil {
 		return fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
 	stderr, err := p.cmd.StderrPipe()
+	defer stderr.Close()
 	if err != nil {
 		return fmt.Errorf("failed to get stderr pipe: %w", err)
 	}
@@ -197,100 +162,70 @@ func (p *Process) runProcess() error {
 
 	// Start the process
 	if err := p.cmd.Start(); err != nil {
-		p.setState(StateFailed)
 		p.setLastError(err)
 		return err
 	}
 
-	p.setState(StateRunning)
+	// Monitor context cancellation and handle graceful shutdown
+	done := make(chan error, 1)
+	go func() {
+		done <- p.cmd.Wait()
+	}()
 
-	// Wait for process completion
-	err = p.cmd.Wait()
-	wg.Wait()
+	select {
+	case err = <-done:
+		// Process completed normally
+		wg.Wait()
+	case <-ctx.Done():
+		// Context cancelled, perform graceful shutdown
+		err = p.gracefulShutdown()
+		wg.Wait()
+	}
 
 	if err != nil {
-		p.setState(StateFailed)
 		p.setLastError(err)
-	} else {
-		p.setState(StateStopped)
 	}
 
 	return err
 }
 
-// Stop gracefully stops the process
-func (p *Process) Stop() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.cancel != nil {
-		p.cancel()
-	}
-
-	// Wait for process to stop gracefully
-	select {
-	case <-p.done:
+// gracefulShutdown performs graceful shutdown with timeout
+func (p *Process) gracefulShutdown() error {
+	if p.cmd.Process == nil {
 		return nil
-	case <-time.After(p.config.StopTimeout):
-		// Force kill if timeout
-		if p.cmd != nil && p.cmd.Process != nil {
-			return p.cmd.Process.Kill()
-		}
 	}
 
-	return nil
+	// Send graceful shutdown signal
+	if err := p.cmd.Process.Signal(p.config.StopSignal); err != nil {
+		// Signal failed, force kill immediately
+		p.cmd.Process.Kill()
+		return p.cmd.Wait()
+	}
+
+	// Wait for graceful shutdown or timeout
+	done := make(chan error, 1)
+	go func() {
+		done <- p.cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(p.config.StopTimeout):
+		// Timeout, force kill
+		p.cmd.Process.Kill()
+		return <-done
+	}
 }
 
 // Wait blocks until the process stops
 func (p *Process) Wait() error {
 	<-p.done
-	p.mu.RLock()
-	err := p.lastError
-	p.mu.RUnlock()
-	return err
-}
-
-// stopProcess stops the current process without canceling supervision
-func (p *Process) stopProcess() {
-	p.mu.RLock()
-	cmd := p.cmd
-	p.mu.RUnlock()
-
-	if cmd != nil && cmd.Process != nil {
-		// Try graceful shutdown first
-		cmd.Process.Signal(os.Interrupt)
-
-		// Wait for graceful shutdown or force kill
-		done := make(chan struct{})
-		go func() {
-			cmd.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			// Process stopped gracefully
-		case <-time.After(p.config.StopTimeout):
-			// Force kill
-			cmd.Process.Kill()
-		}
-	}
-
-	p.setState(StateStopped)
+	return p.lastError
 }
 
 // shouldRestart determines if the process should be restarted
 func (p *Process) shouldRestart(err error) bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	// Check context cancellation
-	select {
-	case <-p.ctx.Done():
-		return false
-	default:
-	}
-
 	// Check restart policy
 	switch p.config.RestartPolicy {
 	case RestartNever:
@@ -317,7 +252,6 @@ func (p *Process) shouldRestart(err error) bool {
 
 // scanLines processes output lines with optional formatting
 func (p *Process) scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter) {
-	defer src.Close()
 	scanner := bufio.NewScanner(src)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -331,62 +265,16 @@ func (p *Process) scanLines(src io.ReadCloser, dest io.Writer, formatter LogForm
 }
 
 // Helper methods
-func (p *Process) setState(state ProcessState) {
-	old := p.getState()
-	p.state.Store(state)
-	if p.config.OnStateChange != nil && old != state {
-		p.config.OnStateChange(old, state)
-	}
-}
-
-func (p *Process) getState() ProcessState {
-	if v := p.state.Load(); v != nil {
-		return v.(ProcessState)
-	}
-	return StateNotStarted
-}
 
 func (p *Process) setLastError(err error) {
-	p.mu.Lock()
 	p.lastError = err
-	p.mu.Unlock()
 
 	if p.config.OnError != nil {
 		p.config.OnError(err)
 	}
 }
 
-// GetState returns the current process state
-func (p *Process) GetState() ProcessState {
-	return p.getState()
-}
-
-// GetRestartCount returns the number of times the process has been restarted
-func (p *Process) GetRestartCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.restartCount
-}
-
-// GetUptime returns how long the process has been running
-func (p *Process) GetUptime() time.Duration {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if p.getState() != StateRunning {
-		return 0
-	}
-	return time.Since(p.startTime)
-}
-
-// GetLastError returns the last error that occurred
-func (p *Process) GetLastError() error {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.lastError
-}
-
-// Utility functions for simple execution (backward compatibility)
+// Utility functions for simple execution
 
 // Run executes a subprocess without management (simple execution)
 func Run(config *Config) error {
@@ -401,56 +289,6 @@ func RunWithContext(ctx context.Context, config *Config) error {
 	}
 
 	process := New(config)
-
-	if err := process.Start(ctx); err != nil {
-		return err
-	}
-
+	process.Start(ctx)
 	return process.Wait()
-}
-
-// Built-in formatter functions
-
-// PrefixFormatter creates a formatter that adds a prefix to each line
-func PrefixFormatter(prefix string) LogFormatter {
-	return func(line string) string {
-		return prefix + line
-	}
-}
-
-// TimestampFormatter adds a timestamp to each line
-func TimestampFormatter(format string) LogFormatter {
-	return func(line string) string {
-		return fmt.Sprintf("[%s] %s", time.Now().Format(format), line)
-	}
-}
-
-// ChainFormatters combines multiple formatters
-func ChainFormatters(formatters ...LogFormatter) LogFormatter {
-	return func(line string) string {
-		for _, formatter := range formatters {
-			if formatter != nil {
-				line = formatter(line)
-			}
-		}
-		return line
-	}
-}
-
-// String returns the string representation of ProcessState
-func (s ProcessState) String() string {
-	switch s {
-	case StateNotStarted:
-		return "not_started"
-	case StateRunning:
-		return "running"
-	case StateStopped:
-		return "stopped"
-	case StateFailed:
-		return "failed"
-	case StateRestarting:
-		return "restarting"
-	default:
-		return "unknown"
-	}
 }
