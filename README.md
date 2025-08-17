@@ -1,10 +1,10 @@
 # go-subprocess
 
-A Go library for managing subprocesses embedded within Go applications.
+A Go library for implementing subprocess management within Go applications.
 
 ## Motivation
 
-This library provides subprocess management capabilities similar to supervisord, but designed to be embedded within Go applications rather than running as a separate daemon. 
+This library provides a simplified version of supervisord's subprocess management capabilities, designed to be implemented within Go applications rather than running as a separate daemon. 
 It's particularly useful for managing auxiliary processes that should share the same lifecycle as the main application, such as:
 
 - Development servers (e.g., Vite dev server alongside a Go web application)
