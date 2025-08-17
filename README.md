@@ -20,6 +20,12 @@ Instead of managing these processes separately with external tools like supervis
 - Graceful shutdown with configurable timeout and signals
 - Custom output formatting for stdout/stderr
 
+## Installation
+
+```sh
+go get github.com/kohkimakimoto/go-subprocess
+```
+
 ## Author
 
 Kohki Makimoto <kohki.makimoto@gmail.com>
