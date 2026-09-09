@@ -3,6 +3,7 @@
 package subprocess
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"syscall"
@@ -36,4 +37,14 @@ func killProcess(cmd *exec.Cmd) {
 	}
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	_ = cmd.Process.Kill()
+}
+
+// processGroupAlive reports whether any process remains in the child's group.
+// The direct child can exit while descendants that ignored the stop signal stay.
+func processGroupAlive(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(-cmd.Process.Pid, 0)
+	return !errors.Is(err, syscall.ESRCH)
 }

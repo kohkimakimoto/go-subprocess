@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,7 +20,7 @@ import (
 
 func TestMain(m *testing.M) {
 	switch os.Getenv("GO_SUBPROCESS_HELPER") {
-	case "parent", "child":
+	case "parent", "child", "parent-ignore", "ignore":
 		runHelper(os.Getenv("GO_SUBPROCESS_HELPER"))
 	default:
 		os.Exit(m.Run())
@@ -67,25 +68,80 @@ func TestCancelKillsProcessGroup(t *testing.T) {
 	t.Fatalf("grandchild %d still running", childPID)
 }
 
+func TestCancelKillsDescendantsThatIgnoreStopSignal(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p, err := New(&Config{
+		Command:     os.Args[0],
+		Env:         helperEnv("parent-ignore", pidFile),
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+		StopTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	childPID := waitForPIDFile(t, pidFile)
+	t.Cleanup(func() {
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
+	})
+
+	started := time.Now()
+	cancel()
+	if err := p.Wait(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(started); elapsed < 80*time.Millisecond {
+		t.Fatalf("Wait returned in %s, want to wait StopTimeout for the group", elapsed)
+	}
+	if processAlive(childPID) {
+		t.Fatalf("grandchild %d still running after Wait", childPID)
+	}
+}
+
 func runHelper(role string) {
 	switch role {
 	case "child":
 		time.Sleep(time.Minute)
-	case "parent":
+	case "ignore":
+		signal.Ignore(os.Interrupt, syscall.SIGTERM)
+		path := os.Getenv("GO_SUBPROCESS_PIDFILE")
+		if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		time.Sleep(time.Minute)
+	case "parent", "parent-ignore":
+		childRole := "child"
+		if role == "parent-ignore" {
+			childRole = "ignore"
+		}
 		cmd := exec.Command(os.Args[0])
-		cmd.Env = helperEnv("child", "")
+		cmd.Env = helperEnv(childRole, os.Getenv("GO_SUBPROCESS_PIDFILE"))
 		if err := cmd.Start(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		path := os.Getenv("GO_SUBPROCESS_PIDFILE")
-		if err := os.WriteFile(path, []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+		if role == "parent" {
+			path := os.Getenv("GO_SUBPROCESS_PIDFILE")
+			if err := os.WriteFile(path, []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
 		}
 		_ = cmd.Wait()
 	}
 	os.Exit(0)
+}
+
+func processAlive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
 }
 
 func helperEnv(role, pidFile string) []string {

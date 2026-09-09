@@ -25,3 +25,7 @@ func killProcess(cmd *exec.Cmd) {
 	}
 	_ = cmd.Process.Kill()
 }
+
+func processGroupAlive(cmd *exec.Cmd) bool {
+	return false
+}

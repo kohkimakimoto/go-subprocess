@@ -112,12 +112,10 @@ func New(c *Config) (*Process, error) {
 	}
 
 	cfg := *c
-	if c.Args != nil {
-		cfg.Args = append([]string(nil), c.Args...)
-	}
-	if c.Env != nil {
-		cfg.Env = append([]string(nil), c.Env...)
-	}
+	// make+copy keeps a non-nil empty slice empty. append onto nil turns it into nil,
+	// and a nil Env means inherit the parent environment.
+	cfg.Args = copyStrings(c.Args)
+	cfg.Env = copyStrings(c.Env)
 	if cfg.Stdout == nil {
 		cfg.Stdout = os.Stdout
 	}
@@ -329,40 +327,39 @@ func (p *Process) runProcess(ctx context.Context) error {
 	cmd.Stdin = p.config.Stdin
 	configureSysProcAttr(cmd)
 
-	var stdout io.ReadCloser
-	var stderr io.ReadCloser
+	// Own the pipes. StdoutPipe/StderrPipe are closed by cmd.Wait, which drops
+	// unread output and makes a slow formatter fail a successful exit.
+	var stdoutR, stdoutW *os.File
+	var stderrR, stderrW *os.File
 	var err error
 
 	if p.config.StdoutFormatter != nil {
-		stdout, err = cmd.StdoutPipe()
+		stdoutR, stdoutW, err = os.Pipe()
 		if err != nil {
 			return fmt.Errorf("subprocess: stdout pipe: %w", err)
 		}
+		cmd.Stdout = stdoutW
 	} else if p.config.Stdout != nil {
 		cmd.Stdout = p.config.Stdout
 	}
 
 	if p.config.StderrFormatter != nil {
-		stderr, err = cmd.StderrPipe()
+		stderrR, stderrW, err = os.Pipe()
 		if err != nil {
-			if stdout != nil {
-				stdout.Close()
-			}
+			closeFiles(stdoutR, stdoutW)
 			return fmt.Errorf("subprocess: stderr pipe: %w", err)
 		}
+		cmd.Stderr = stderrW
 	} else if p.config.Stderr != nil {
 		cmd.Stderr = p.config.Stderr
 	}
 
 	if err := cmd.Start(); err != nil {
-		if stdout != nil {
-			stdout.Close()
-		}
-		if stderr != nil {
-			stderr.Close()
-		}
+		closeFiles(stdoutR, stdoutW, stderrR, stderrW)
 		return err
 	}
+	// Drop the parent's write ends so readers see EOF when the child exits.
+	closeFiles(stdoutW, stderrW)
 
 	p.mu.Lock()
 	p.cmd = cmd
@@ -371,20 +368,20 @@ func (p *Process) runProcess(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
-	if stdout != nil {
+	if stdoutR != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if scanErr := scanLines(stdout, p.config.Stdout, p.config.StdoutFormatter); scanErr != nil {
+			if scanErr := scanLines(stdoutR, p.config.Stdout, p.config.StdoutFormatter); scanErr != nil {
 				errCh <- scanErr
 			}
 		}()
 	}
-	if stderr != nil {
+	if stderrR != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if scanErr := scanLines(stderr, p.config.Stderr, p.config.StderrFormatter); scanErr != nil {
+			if scanErr := scanLines(stderrR, p.config.Stderr, p.config.StderrFormatter); scanErr != nil {
 				errCh <- scanErr
 			}
 		}()
@@ -421,28 +418,88 @@ func (p *Process) waitOrShutdown(ctx context.Context, cmd *exec.Cmd) error {
 
 	select {
 	case err := <-waitDone:
-		return err
+		if ctx.Err() == nil {
+			return err
+		}
+		// Cancellation won the race with the child's exit. Descendants may
+		// still be alive and have not been signaled.
+		return p.shutdownGroup(ctx, cmd, nil, true, err)
 	case <-ctx.Done():
-		return p.shutdown(ctx, cmd, waitDone)
+		return p.shutdownGroup(ctx, cmd, waitDone, false, nil)
 	}
 }
 
-// shutdown signals the child and waits on the single Wait already in progress.
-func (p *Process) shutdown(ctx context.Context, cmd *exec.Cmd, waitDone <-chan error) error {
+// shutdownGroup signals the process group and waits until the direct child and
+// the rest of the group are gone, or StopTimeout elapses. Child exit alone is
+// not enough: a parent that dies on the stop signal leaves descendants that
+// ignore it. waitDone is nil when the child has already been waited.
+func (p *Process) shutdownGroup(ctx context.Context, cmd *exec.Cmd, waitDone <-chan error, childExited bool, waitErr error) error {
 	if err := signalProcess(cmd, p.config.StopSignal); err != nil {
 		killProcess(cmd)
-		return wrapContextError(ctx, <-waitDone)
+		if !childExited {
+			waitErr = <-waitDone
+		}
+		waitForProcessGroup(cmd)
+		return wrapContextError(ctx, waitErr)
 	}
 
 	timer := time.NewTimer(p.config.StopTimeout)
 	defer timer.Stop()
 
-	select {
-	case err := <-waitDone:
-		return wrapContextError(ctx, err)
-	case <-timer.C:
-		killProcess(cmd)
-		return wrapContextError(ctx, <-waitDone)
+	var poll *time.Ticker
+	var pollC <-chan time.Time
+	defer func() {
+		if poll != nil {
+			poll.Stop()
+		}
+	}()
+
+	startPoll := func() {
+		if poll != nil {
+			return
+		}
+		poll = time.NewTicker(10 * time.Millisecond)
+		pollC = poll.C
+	}
+
+	if childExited && !processGroupAlive(cmd) {
+		return wrapContextError(ctx, waitErr)
+	}
+	if childExited {
+		startPoll()
+	}
+
+	for {
+		select {
+		case err := <-waitDone:
+			waitErr = err
+			childExited = true
+			waitDone = nil
+			if !processGroupAlive(cmd) {
+				return wrapContextError(ctx, waitErr)
+			}
+			startPoll()
+		case <-pollC:
+			if childExited && !processGroupAlive(cmd) {
+				return wrapContextError(ctx, waitErr)
+			}
+		case <-timer.C:
+			killProcess(cmd)
+			if !childExited {
+				waitErr = <-waitDone
+			}
+			waitForProcessGroup(cmd)
+			return wrapContextError(ctx, waitErr)
+		}
+	}
+}
+
+// waitForProcessGroup waits until a just-sent SIGKILL has reaped the group.
+// Processes in uninterruptible sleep can linger; do not block forever.
+func waitForProcessGroup(cmd *exec.Cmd) {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for processGroupAlive(cmd) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -507,6 +564,23 @@ func scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter) error 
 		return fmt.Errorf("subprocess: scan output: %w", err)
 	}
 	return nil
+}
+
+func copyStrings(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, len(s))
+	copy(out, s)
+	return out
+}
+
+func closeFiles(files ...*os.File) {
+	for _, f := range files {
+		if f != nil {
+			_ = f.Close()
+		}
+	}
 }
 
 func writeLine(dest io.Writer, line string) error {

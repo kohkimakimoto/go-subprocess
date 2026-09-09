@@ -52,6 +52,101 @@ func TestRunEcho(t *testing.T) {
 	}
 }
 
+func TestEmptyEnvIsNotInherited(t *testing.T) {
+	const key = "GO_SUBPROCESS_EMPTY_ENV"
+	t.Setenv(key, "inherited")
+
+	env := []string{}
+	p, err := New(&Config{Command: "sh", Env: env})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.config.Env == nil {
+		t.Fatal("empty Env became nil")
+	}
+	env = append(env, key+"=leaked")
+	if len(p.config.Env) != 0 {
+		t.Fatal("Env aliases the caller slice")
+	}
+
+	var buf bytes.Buffer
+	err = Run(&Config{
+		Command: "sh",
+		Args:    []string{"-c", "printf %s \"$" + key + "\""},
+		Env:     []string{},
+		Stdout:  &buf,
+		Stderr:  io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("empty Env inherited %s=%q", key, got)
+	}
+}
+
+func TestNilEnvInherits(t *testing.T) {
+	const key = "GO_SUBPROCESS_NIL_ENV"
+	t.Setenv(key, "inherited")
+
+	var buf bytes.Buffer
+	err := Run(&Config{
+		Command: "sh",
+		Args:    []string{"-c", "printf %s \"$" + key + "\""},
+		Stdout:  &buf,
+		Stderr:  io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); got != "inherited" {
+		t.Fatalf("nil Env = %q, want inherited", got)
+	}
+}
+
+func TestSlowFormatterKeepsSuccessfulOutput(t *testing.T) {
+	const n = 200
+	script := fmt.Sprintf(`i=1; while [ "$i" -le %d ]; do echo "out-$i"; echo "err-$i" >&2; i=$((i+1)); done`, n)
+
+	var stdout, stderr bytes.Buffer
+	p, err := New(&Config{
+		Command: "sh",
+		Args:    []string{"-c", script},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+		StdoutFormatter: func(line string) string {
+			time.Sleep(time.Millisecond)
+			return line
+		},
+		StderrFormatter: func(line string) string {
+			time.Sleep(time.Millisecond)
+			return line
+		},
+		RestartPolicy:  RestartOnFail,
+		MaxRestarts:    1,
+		RestartDelay:   10 * time.Millisecond,
+		RestartBackoff: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if p.RestartCount() != 0 {
+		t.Fatalf("restarts = %d, want 0", p.RestartCount())
+	}
+	if got := strings.Count(stdout.String(), "\n"); got != n {
+		t.Fatalf("stdout lines = %d, want %d", got, n)
+	}
+	if got := strings.Count(stderr.String(), "\n"); got != n {
+		t.Fatalf("stderr lines = %d, want %d", got, n)
+	}
+}
+
 func TestFormatterAndLongLine(t *testing.T) {
 	var buf bytes.Buffer
 	err := Run(&Config{
