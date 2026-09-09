@@ -389,7 +389,24 @@ func (p *Process) runProcess(ctx context.Context) error {
 
 	waitErr := p.waitOrShutdown(ctx, cmd)
 	p.recordExit(cmd)
-	wg.Wait()
+	outputDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(outputDone)
+	}()
+	// The child may have exited while descendants still hold the output pipes.
+	// Keep cancellation active until the formatted output has been drained.
+	if errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
+		// waitOrShutdown has already stopped the group.
+		<-outputDone
+	} else {
+		select {
+		case <-outputDone:
+		case <-ctx.Done():
+			waitErr = p.shutdownGroup(ctx, cmd, nil, true, waitErr)
+			<-outputDone
+		}
+	}
 	close(errCh)
 
 	var scanErr error

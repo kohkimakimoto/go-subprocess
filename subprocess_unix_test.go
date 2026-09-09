@@ -20,7 +20,7 @@ import (
 
 func TestMain(m *testing.M) {
 	switch os.Getenv("GO_SUBPROCESS_HELPER") {
-	case "parent", "child", "parent-ignore", "ignore":
+	case "parent", "child", "parent-ignore", "parent-exit", "ignore":
 		runHelper(os.Getenv("GO_SUBPROCESS_HELPER"))
 	default:
 		os.Exit(m.Run())
@@ -117,16 +117,23 @@ func runHelper(role string) {
 			os.Exit(1)
 		}
 		time.Sleep(time.Minute)
-	case "parent", "parent-ignore":
+	case "parent", "parent-ignore", "parent-exit":
 		childRole := "child"
-		if role == "parent-ignore" {
+		if role == "parent-ignore" || role == "parent-exit" {
 			childRole = "ignore"
 		}
 		cmd := exec.Command(os.Args[0])
 		cmd.Env = helperEnv(childRole, os.Getenv("GO_SUBPROCESS_PIDFILE"))
+		if role == "parent-exit" {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+		}
 		if err := cmd.Start(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
+		}
+		if role == "parent-exit" {
+			os.Exit(0)
 		}
 		if role == "parent" {
 			path := os.Getenv("GO_SUBPROCESS_PIDFILE")
@@ -175,4 +182,73 @@ func waitForPIDFile(t *testing.T, path string) int {
 	}
 	t.Fatal("child pid file was not written")
 	return 0
+}
+
+func TestCancelWhileDrainingDescendantOutput(t *testing.T) {
+	for _, stream := range []string{"stdout", "stderr"} {
+		t.Run(stream, func(t *testing.T) {
+			pidFile := filepath.Join(t.TempDir(), "child.pid")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cfg := &Config{
+				Command:     os.Args[0],
+				Env:         helperEnv("parent-exit", pidFile),
+				Stdout:      os.Stdout,
+				Stderr:      os.Stderr,
+				StopTimeout: 50 * time.Millisecond,
+			}
+			formatter := func(s string) string { return s }
+			if stream == "stdout" {
+				cfg.StdoutFormatter = formatter
+				cfg.Stdout = io.Discard
+			} else {
+				cfg.StderrFormatter = formatter
+				cfg.Stderr = io.Discard
+			}
+			p, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- p.Wait() }()
+			t.Cleanup(func() {
+				cancel()
+				if pid := p.Pid(); pid > 0 {
+					_ = syscall.Kill(-pid, syscall.SIGKILL)
+				}
+			})
+			childPID := waitForPIDFile(t, pidFile)
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				if _, exited := p.ExitCode(); exited {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("parent did not exit")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			// The direct child has exited, but the descendant still owns the pipe.
+			select {
+			case err := <-done:
+				t.Fatalf("Wait returned before cancellation: %v", err)
+			default:
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Wait = %v, want context.Canceled", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("Wait blocked while draining descendant output after cancellation")
+			}
+			if processAlive(childPID) {
+				t.Fatalf("descendant %d still alive", childPID)
+			}
+		})
+	}
 }
