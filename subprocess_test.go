@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -447,4 +448,54 @@ func waitUntilRunning(t *testing.T, p *Process) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("process did not start")
+}
+
+// overlapWriter detects concurrent calls without introducing a test-side data race.
+type overlapWriter struct {
+	active     atomic.Int32
+	overlapped atomic.Bool
+	mu         sync.Mutex
+	buf        bytes.Buffer
+}
+
+func (w *overlapWriter) Write(b []byte) (int, error) {
+	if w.active.Add(1) > 1 {
+		w.overlapped.Store(true)
+	}
+	defer w.active.Add(-1)
+	time.Sleep(time.Millisecond)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(b)
+}
+
+func TestSharedWriterWithOneFormatter(t *testing.T) {
+	for _, stream := range []string{"stdout", "stderr"} {
+		t.Run(stream, func(t *testing.T) {
+			var output overlapWriter
+			cfg := &Config{
+				Command: "sh",
+				Args:    []string{"-c", `i=0; while [ "$i" -lt 100 ]; do echo out; echo err >&2; i=$((i+1)); done`},
+				Stdout:  &output,
+				Stderr:  &output,
+			}
+			formatter := func(s string) string { return s }
+			if stream == "stdout" {
+				cfg.StdoutFormatter = formatter
+			} else {
+				cfg.StderrFormatter = formatter
+			}
+			if err := Run(cfg); err != nil {
+				t.Fatal(err)
+			}
+			if output.overlapped.Load() {
+				t.Error("shared Writer received concurrent writes")
+			}
+			for _, line := range []string{"out\n", "err\n"} {
+				if got := strings.Count(output.buf.String(), line); got != 100 {
+					t.Errorf("output contains %d copies of %q, want 100", got, line)
+				}
+			}
+		})
+	}
 }

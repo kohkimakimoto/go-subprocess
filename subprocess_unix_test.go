@@ -133,6 +133,14 @@ func runHelper(role string) {
 			os.Exit(1)
 		}
 		if role == "parent-exit" {
+			// An optional argument makes the unformatted copier fail before exit.
+			if len(os.Args) > 1 {
+				if os.Args[1] == "stdout" {
+					fmt.Fprintln(os.Stdout, "writer-error")
+				} else if os.Args[1] == "stderr" {
+					fmt.Fprintln(os.Stderr, "writer-error")
+				}
+			}
 			os.Exit(0)
 		}
 		if role == "parent" {
@@ -250,5 +258,80 @@ func TestCancelWhileDrainingDescendantOutput(t *testing.T) {
 				t.Fatalf("descendant %d still alive", childPID)
 			}
 		})
+	}
+}
+
+type contextErrorWriter struct{ err error }
+
+func (w contextErrorWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestCancelAfterOutputWriterContextError(t *testing.T) {
+	for _, writerErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		for _, stream := range []string{"stdout", "stderr"} {
+			t.Run(writerErr.Error()+"/"+stream, func(t *testing.T) {
+				pidFile := filepath.Join(t.TempDir(), "child.pid")
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				cfg := &Config{
+					Command:     os.Args[0],
+					Args:        []string{stream},
+					Env:         helperEnv("parent-exit", pidFile),
+					Stdout:      io.Discard,
+					Stderr:      io.Discard,
+					StopTimeout: 50 * time.Millisecond,
+				}
+				formatter := func(s string) string { return s }
+				if stream == "stdout" {
+					cfg.Stdout = contextErrorWriter{writerErr}
+					cfg.StderrFormatter = formatter
+				} else {
+					cfg.Stderr = contextErrorWriter{writerErr}
+					cfg.StdoutFormatter = formatter
+				}
+				p, err := New(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := p.Start(ctx); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- p.Wait() }()
+				t.Cleanup(func() {
+					cancel()
+					if pid := p.Pid(); pid > 0 {
+						_ = syscall.Kill(-pid, syscall.SIGKILL)
+					}
+				})
+				childPID := waitForPIDFile(t, pidFile)
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					if _, exited := p.ExitCode(); exited {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("parent did not exit")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("Wait returned before cancellation: %v", err)
+				default:
+				}
+				cancel()
+				select {
+				case err := <-done:
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("Wait = %v, want context.Canceled", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("Writer context error prevented cancellation while draining descendant output")
+				}
+				if processAlive(childPID) {
+					t.Fatalf("descendant %d still alive", childPID)
+				}
+			})
+		}
 	}
 }

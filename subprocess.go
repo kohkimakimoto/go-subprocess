@@ -45,6 +45,8 @@ type Config struct {
 	StdoutFormatter LogFormatter
 	StderrFormatter LogFormatter
 	// Stdin is the process standard input. Nil means the null device, not os.Stdin.
+	// The caller owns Stdin; it is never closed by Process. For a non-file Reader,
+	// a blocked Read may outlive Wait until the caller unblocks or closes it.
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
@@ -217,13 +219,32 @@ func (p *Process) ExitCode() (int, bool) {
 func (p *Process) supervise(ctx context.Context) {
 	defer close(p.done)
 
+	var input *managedInput
+	defer func() {
+		if input != nil {
+			closeFiles(input.reader, input.writer)
+		}
+	}()
+
 	for {
 		if err := ctx.Err(); err != nil {
 			p.setLastError(err)
 			return
 		}
 
-		err := p.runProcess(ctx)
+		// Keep one input pump across restarts. A pending Read must not compete
+		// with another run for the same caller-owned Reader.
+		if input == nil && p.config.Stdin != nil {
+			if _, isFile := p.config.Stdin.(*os.File); !isFile {
+				var err error
+				input, err = newManagedInput()
+				if err != nil {
+					p.setLastError(err)
+					return
+				}
+			}
+		}
+		err := p.runProcess(ctx, input)
 		p.setLastError(err)
 
 		if ctx.Err() != nil {
@@ -235,6 +256,17 @@ func (p *Process) supervise(ctx context.Context) {
 		if err := p.waitRestart(ctx); err != nil {
 			p.setLastError(err)
 			return
+		}
+		if input != nil {
+			select {
+			case <-input.done:
+				if input.err != nil {
+					// A subsequent Read may recover from a transient input error.
+					closeFiles(input.reader, input.writer)
+					input = nil
+				}
+			default:
+			}
 		}
 	}
 }
@@ -316,7 +348,38 @@ func (p *Process) shouldRestart(err error) bool {
 	}
 }
 
-func (p *Process) runProcess(ctx context.Context) error {
+// managedInput owns the pipe, but not the source Reader. Its pump may remain
+// blocked in the source after shutdown; closing our files releases all owned
+// descriptors and prevents subsequent writes. At most one pump exists per Process.
+type managedInput struct {
+	reader, writer *os.File
+	done           chan struct{}
+	err            error // published by closing done
+	started        bool  // accessed only by the supervisor
+}
+
+func newManagedInput() (*managedInput, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("subprocess: stdin pipe: %w", err)
+	}
+	return &managedInput{reader: r, writer: w, done: make(chan struct{})}, nil
+}
+
+func (in *managedInput) start(src io.Reader) {
+	if in.started {
+		return
+	}
+	in.started = true
+	go func() {
+		_, in.err = io.Copy(in.writer, src)
+		// Publish errors before closing the pipe lets the child observe EOF.
+		close(in.done)
+		closeFiles(in.writer)
+	}()
+}
+
+func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -326,6 +389,12 @@ func (p *Process) runProcess(ctx context.Context) error {
 	cmd.Env = p.config.Env
 	cmd.Stdin = p.config.Stdin
 	configureSysProcAttr(cmd)
+
+	// Give exec a file so cmd.Wait does not wait for a caller-owned Reader's
+	// potentially uninterruptible Read. The supervisor owns the pipe's lifetime.
+	if input != nil {
+		cmd.Stdin = input.reader
+	}
 
 	// Own the pipes. StdoutPipe/StderrPipe are closed by cmd.Wait, which drops
 	// unread output and makes a slow formatter fail a successful exit.
@@ -340,7 +409,7 @@ func (p *Process) runProcess(ctx context.Context) error {
 		}
 		cmd.Stdout = stdoutW
 	} else if p.config.Stdout != nil {
-		cmd.Stdout = p.config.Stdout
+		cmd.Stdout = outputWriter(p.config.Stdout)
 	}
 
 	if p.config.StderrFormatter != nil {
@@ -351,7 +420,7 @@ func (p *Process) runProcess(ctx context.Context) error {
 		}
 		cmd.Stderr = stderrW
 	} else if p.config.Stderr != nil {
-		cmd.Stderr = p.config.Stderr
+		cmd.Stderr = outputWriter(p.config.Stderr)
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -360,6 +429,9 @@ func (p *Process) runProcess(ctx context.Context) error {
 	}
 	// Drop the parent's write ends so readers see EOF when the child exits.
 	closeFiles(stdoutW, stderrW)
+	if input != nil {
+		input.start(p.config.Stdin)
+	}
 
 	p.mu.Lock()
 	p.cmd = cmd
@@ -387,7 +459,7 @@ func (p *Process) runProcess(ctx context.Context) error {
 		}()
 	}
 
-	waitErr := p.waitOrShutdown(ctx, cmd)
+	waitErr, shutdown := p.waitOrShutdown(ctx, cmd)
 	p.recordExit(cmd)
 	outputDone := make(chan struct{})
 	go func() {
@@ -396,7 +468,7 @@ func (p *Process) runProcess(ctx context.Context) error {
 	}()
 	// The child may have exited while descendants still hold the output pipes.
 	// Keep cancellation active until the formatted output has been drained.
-	if errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
+	if shutdown {
 		// waitOrShutdown has already stopped the group.
 		<-outputDone
 	} else {
@@ -413,6 +485,16 @@ func (p *Process) runProcess(ctx context.Context) error {
 	for e := range errCh {
 		scanErr = errors.Join(scanErr, e)
 	}
+	// Preserve completed input errors, but never wait for a blocked Reader.
+	if input != nil && waitErr == nil {
+		select {
+		case <-input.done:
+			if input.err != nil {
+				waitErr = fmt.Errorf("subprocess: stdin: %w", input.err)
+			}
+		default:
+		}
+	}
 	return combineRunError(waitErr, scanErr)
 }
 
@@ -427,7 +509,7 @@ func (p *Process) recordExit(cmd *exec.Cmd) {
 	p.exited = true
 }
 
-func (p *Process) waitOrShutdown(ctx context.Context, cmd *exec.Cmd) error {
+func (p *Process) waitOrShutdown(ctx context.Context, cmd *exec.Cmd) (err error, shutdown bool) {
 	waitDone := make(chan error, 1)
 	go func() {
 		waitDone <- cmd.Wait()
@@ -436,13 +518,13 @@ func (p *Process) waitOrShutdown(ctx context.Context, cmd *exec.Cmd) error {
 	select {
 	case err := <-waitDone:
 		if ctx.Err() == nil {
-			return err
+			return err, false
 		}
 		// Cancellation won the race with the child's exit. Descendants may
 		// still be alive and have not been signaled.
-		return p.shutdownGroup(ctx, cmd, nil, true, err)
+		return p.shutdownGroup(ctx, cmd, nil, true, err), true
 	case <-ctx.Done():
-		return p.shutdownGroup(ctx, cmd, waitDone, false, nil)
+		return p.shutdownGroup(ctx, cmd, waitDone, false, nil), true
 	}
 }
 
@@ -555,9 +637,25 @@ func combineRunError(waitErr, scanErr error) error {
 	return fmt.Errorf("%w; output: %v", waitErr, scanErr)
 }
 
-// lineWriteMu serializes formatted line writes so concurrent stdout/stderr
-// and multiple processes do not interleave mid-line.
+// lineWriteMu serializes writes to non-file output destinations, including
+// unformatted output, so shared Writers are safe across streams and processes.
 var lineWriteMu sync.Mutex
+
+type lockedWriter struct{ dest io.Writer }
+
+func (w lockedWriter) Write(b []byte) (int, error) {
+	lineWriteMu.Lock()
+	defer lineWriteMu.Unlock()
+	return w.dest.Write(b)
+}
+
+func outputWriter(dest io.Writer) io.Writer {
+	// Keep files connected directly to the child, preserving file semantics.
+	if _, ok := dest.(*os.File); ok {
+		return dest
+	}
+	return lockedWriter{dest: dest}
+}
 
 func scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter) error {
 	defer src.Close()

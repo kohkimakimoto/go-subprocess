@@ -74,6 +74,11 @@ Context cancellation is wrapped so `errors.Is(err, context.Canceled)` and `error
 `OnError` is not called for cancellation.
 `OnRestart` and `OnError` must not call `Wait`.
 
+`Stdin` remains owned by the caller and is never closed by the library.
+For non-file readers, input is transferred through a pipe shared across restarts.
+A blocked input `Read` does not prevent `Wait` from returning, but that read can
+remain pending until the caller unblocks or closes the reader.
+
 On Unix, the child is placed in its own process group. Stop signals and the timeout kill are sent to that group, so grandchild processes do not remain after shutdown.
 Shell background jobs often ignore `SIGINT` and `SIGTERM`; those descendants are reaped when `StopTimeout` elapses and the group is killed.
 
