@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -18,6 +19,9 @@ const (
 	defaultRestartDelayMax = 30 * time.Second
 	defaultStopTimeout     = 10 * time.Second
 	maxScanTokenSize       = 1024 * 1024
+	// outputDrainGrace is how long to wait for scanners after force-closing
+	// their pipe ends when a drain timeout expires.
+	outputDrainGrace = 100 * time.Millisecond
 )
 
 // RestartPolicy defines how a process should be restarted.
@@ -467,23 +471,30 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 		close(outputDone)
 	}()
 	// The child may have exited while descendants still hold the output pipes.
-	// Keep cancellation active until the formatted output has been drained.
+	// After shutdown, bound the drain so a stuck pipe or blocked Writer cannot
+	// keep Wait hanging after cancellation.
+	abandoned := false
 	if shutdown {
-		// waitOrShutdown has already stopped the group.
-		<-outputDone
+		abandoned = waitOutputDrain(outputDone, p.config.StopTimeout, stdoutR, stderrR)
 	} else {
 		select {
 		case <-outputDone:
 		case <-ctx.Done():
 			waitErr = p.shutdownGroup(ctx, cmd, nil, true, waitErr)
-			<-outputDone
+			abandoned = waitOutputDrain(outputDone, p.config.StopTimeout, stdoutR, stderrR)
 		}
 	}
-	close(errCh)
 
 	var scanErr error
-	for e := range errCh {
-		scanErr = errors.Join(scanErr, e)
+	if abandoned {
+		// Scanners may still be blocked in a destination Write; take only
+		// errors already reported and return so Wait can unblock.
+		scanErr = takeReadyErrors(errCh)
+	} else {
+		close(errCh)
+		for e := range errCh {
+			scanErr = errors.Join(scanErr, e)
+		}
 	}
 	// Preserve completed input errors, but never wait for a blocked Reader.
 	if input != nil && waitErr == nil {
@@ -602,6 +613,47 @@ func waitForProcessGroup(cmd *exec.Cmd) {
 	}
 }
 
+// waitOutputDrain waits for formatted output scanners to finish. On timeout it
+// closes the pipe read ends so a scanner blocked on Read can exit. If a
+// scanner is stuck in a destination Write, it abandons the wait so Wait can
+// return after shutdown/cancellation.
+func waitOutputDrain(done <-chan struct{}, timeout time.Duration, pipes ...*os.File) bool {
+	if timeout <= 0 {
+		timeout = defaultStopTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return false
+	case <-timer.C:
+	}
+
+	closeFiles(pipes...)
+
+	grace := time.NewTimer(outputDrainGrace)
+	defer grace.Stop()
+	select {
+	case <-done:
+		return false
+	case <-grace.C:
+		return true
+	}
+}
+
+func takeReadyErrors(errCh <-chan error) error {
+	var joined error
+	for {
+		select {
+		case e := <-errCh:
+			joined = errors.Join(joined, e)
+		default:
+			return joined
+		}
+	}
+}
+
 func (p *Process) setLastError(err error) {
 	p.mu.Lock()
 	p.lastError = err
@@ -637,15 +689,16 @@ func combineRunError(waitErr, scanErr error) error {
 	return fmt.Errorf("%w; output: %v", waitErr, scanErr)
 }
 
-// lineWriteMu serializes writes to non-file output destinations, including
-// unformatted output, so shared Writers are safe across streams and processes.
-var lineWriteMu sync.Mutex
+// writerLocks holds a mutex per destination Writer identity so shared Writers
+// are safe across streams and processes, without serializing unrelated writers.
+var writerLocks sync.Map // uintptr -> *sync.Mutex
 
 type lockedWriter struct{ dest io.Writer }
 
 func (w lockedWriter) Write(b []byte) (int, error) {
-	lineWriteMu.Lock()
-	defer lineWriteMu.Unlock()
+	mu := mutexForWriter(w.dest)
+	mu.Lock()
+	defer mu.Unlock()
 	return w.dest.Write(b)
 }
 
@@ -655,6 +708,32 @@ func outputWriter(dest io.Writer) io.Writer {
 		return dest
 	}
 	return lockedWriter{dest: dest}
+}
+
+// mutexForWriter returns a lock for dest based on its pointer identity.
+// Distinct Writer values do not share a lock. Non-pointer Writers get a
+// private mutex (no cross-process sharing for that value).
+func mutexForWriter(dest io.Writer) *sync.Mutex {
+	if dest == nil {
+		mu := &sync.Mutex{}
+		return mu
+	}
+	v := reflect.ValueOf(dest)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.UnsafePointer:
+		if v.IsNil() {
+			return &sync.Mutex{}
+		}
+		key := v.Pointer()
+		if existing, ok := writerLocks.Load(key); ok {
+			return existing.(*sync.Mutex)
+		}
+		mu := &sync.Mutex{}
+		actual, _ := writerLocks.LoadOrStore(key, mu)
+		return actual.(*sync.Mutex)
+	default:
+		return &sync.Mutex{}
+	}
 }
 
 func scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter) error {
@@ -703,8 +782,9 @@ func writeLine(dest io.Writer, line string) error {
 	copy(buf, line)
 	buf[len(line)] = '\n'
 
-	lineWriteMu.Lock()
-	defer lineWriteMu.Unlock()
+	mu := mutexForWriter(dest)
+	mu.Lock()
+	defer mu.Unlock()
 	_, err := dest.Write(buf)
 	return err
 }

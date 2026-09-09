@@ -499,3 +499,116 @@ func TestSharedWriterWithOneFormatter(t *testing.T) {
 		})
 	}
 }
+
+type blockingWriter struct {
+	ready chan struct{}
+	block chan struct{}
+}
+
+func (w *blockingWriter) Write(b []byte) (int, error) {
+	select {
+	case <-w.ready:
+	default:
+		close(w.ready)
+	}
+	<-w.block
+	return len(b), nil
+}
+
+func TestCancelWithBlockedOutputWriter(t *testing.T) {
+	w := &blockingWriter{
+		ready: make(chan struct{}),
+		block: make(chan struct{}),
+	}
+	defer close(w.block)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, err := New(&Config{
+		Command:         "sh",
+		Args:            []string{"-c", "echo hello; sleep 30"},
+		Stdout:          w,
+		Stderr:          io.Discard,
+		StdoutFormatter: func(s string) string { return s },
+		StopTimeout:     50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer was not called")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- p.Wait() }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Wait = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait blocked on output Writer after cancellation")
+	}
+}
+
+func TestDistinctWritersDoNotShareLock(t *testing.T) {
+	slow := &blockingWriter{
+		ready: make(chan struct{}),
+		block: make(chan struct{}),
+	}
+	defer close(slow.block)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, err := New(&Config{
+		Command:         "sh",
+		Args:            []string{"-c", "echo slow; sleep 30"},
+		Stdout:          slow,
+		Stderr:          io.Discard,
+		StdoutFormatter: func(s string) string { return s },
+		StopTimeout:     50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-slow.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow writer was not called")
+	}
+
+	var fast bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(&Config{
+			Command:         "echo",
+			Args:            []string{"fast"},
+			Stdout:          &fast,
+			Stderr:          io.Discard,
+			StdoutFormatter: func(s string) string { return s },
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("distinct Writer blocked behind unrelated process lock")
+	}
+	if got := fast.String(); got != "fast\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+
+	cancel()
+	_ = p.Wait()
+}
