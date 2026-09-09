@@ -11,7 +11,6 @@ import (
 )
 
 func ExampleRun() {
-	// Simple execution using Run function
 	config := &subprocess.Config{
 		Command: "echo",
 		Args:    []string{"Hello, World!"},
@@ -25,7 +24,6 @@ func ExampleRun() {
 }
 
 func ExampleConfig_stdoutFormatter() {
-	// Using a custom formatter for stdout
 	config := &subprocess.Config{
 		Command: "echo",
 		Args:    []string{"test message"},
@@ -39,21 +37,26 @@ func ExampleConfig_stdoutFormatter() {
 }
 
 func ExampleProcess_timeout() {
-	// Create a context with 1 second timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	// Run a long-running command that will be cancelled by timeout
 	config := &subprocess.Config{
 		Command: "sleep",
-		Args:    []string{"10"}, // Sleep for 10 seconds
-		Stdout:  io.Discard,     // Suppress output for testing
-		Stderr:  io.Discard,     // Suppress output for testing
+		Args:    []string{"10"},
+		Stdout:  io.Discard,
+		Stderr:  io.Discard,
 	}
 
-	process := subprocess.New(config)
-	process.Start(ctx)
-	err := process.Wait()
+	process, err := subprocess.New(config)
+	if err != nil {
+		fmt.Printf("Failed to create process: %v\n", err)
+		return
+	}
+	if err := process.Start(ctx); err != nil {
+		fmt.Printf("Failed to start process: %v\n", err)
+		return
+	}
+	err = process.Wait()
 
 	if err != nil {
 		fmt.Println("Process terminated by timeout")
