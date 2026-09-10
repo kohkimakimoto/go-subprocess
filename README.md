@@ -90,14 +90,20 @@ Without a formatter, `*os.File` destinations are connected directly (binary pres
 other Writers are copied through a pipe (also binary-preserving).
 
 ```go
-config := subprocess.Config{
+err := subprocess.Run(subprocess.Config{
     Command: "echo",
     Args:    []string{"test message"},
     StdoutFormatter: subprocess.ChainFormatters(
         subprocess.TimestampFormatter(time.RFC3339),
         subprocess.PrefixFormatter("[app] "),
     ),
-}
+})
+```
+
+Example output:
+
+```text
+[app] [2026-09-10T01:48:00Z] test message
 ```
 
 ## Author
