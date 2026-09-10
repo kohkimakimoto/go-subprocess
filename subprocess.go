@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"reflect"
 	"sync"
 	"time"
 )
@@ -92,6 +91,7 @@ type Process struct {
 	config Config
 
 	mu           sync.Mutex
+	outMu        sync.Mutex // serializes this Process's stdout/stderr pumps
 	cmd          *exec.Cmd
 	started      bool
 	running      bool
@@ -447,9 +447,9 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 			defer wg.Done()
 			var pumpErr error
 			if formatter != nil {
-				pumpErr = scanLines(r, dest, formatter)
+				pumpErr = scanLines(r, dest, formatter, &p.outMu)
 			} else {
-				pumpErr = copyOutput(r, dest)
+				pumpErr = copyOutput(r, dest, &p.outMu)
 			}
 			if pumpErr != nil {
 				errCh <- pumpErr
@@ -680,16 +680,15 @@ func combineRunError(waitErr, scanErr error) error {
 	return fmt.Errorf("%w; output: %v", waitErr, scanErr)
 }
 
-// writerLocks maps destination Writer pointer identity to a mutex so shared
-// Writers are serialized across streams and processes.
-var writerLocks sync.Map // uintptr -> *sync.Mutex
-
-type lockedWriter struct{ dest io.Writer }
+// lockedWriter serializes Write calls with mu.
+type lockedWriter struct {
+	mu   *sync.Mutex
+	dest io.Writer
+}
 
 func (w lockedWriter) Write(b []byte) (int, error) {
-	mu := mutexForWriter(w.dest)
-	mu.Lock()
-	defer mu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.dest.Write(b)
 }
 
@@ -706,32 +705,7 @@ func ownOutputPipe(dest io.Writer, formatter LogFormatter) bool {
 	return !isFile
 }
 
-// mutexForWriter returns the lock for dest's pointer identity.
-// Non-pointer Writers get a private mutex for that call only.
-func mutexForWriter(dest io.Writer) *sync.Mutex {
-	if dest == nil {
-		mu := &sync.Mutex{}
-		return mu
-	}
-	v := reflect.ValueOf(dest)
-	switch v.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.UnsafePointer:
-		if v.IsNil() {
-			return &sync.Mutex{}
-		}
-		key := v.Pointer()
-		if existing, ok := writerLocks.Load(key); ok {
-			return existing.(*sync.Mutex)
-		}
-		mu := &sync.Mutex{}
-		actual, _ := writerLocks.LoadOrStore(key, mu)
-		return actual.(*sync.Mutex)
-	default:
-		return &sync.Mutex{}
-	}
-}
-
-func scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter) error {
+func scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter, mu *sync.Mutex) error {
 	defer src.Close()
 
 	if dest == nil {
@@ -745,7 +719,7 @@ func scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter) error 
 		if formatter != nil {
 			line = formatter(line)
 		}
-		if err := writeLine(dest, line); err != nil {
+		if err := writeLine(dest, line, mu); err != nil {
 			return err
 		}
 	}
@@ -755,13 +729,13 @@ func scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter) error 
 	return nil
 }
 
-func copyOutput(src io.ReadCloser, dest io.Writer) error {
+func copyOutput(src io.ReadCloser, dest io.Writer, mu *sync.Mutex) error {
 	defer src.Close()
 
 	if dest == nil {
 		dest = io.Discard
 	}
-	_, err := io.Copy(lockedWriter{dest: dest}, src)
+	_, err := io.Copy(lockedWriter{mu: mu, dest: dest}, src)
 	if err != nil {
 		return fmt.Errorf("subprocess: copy output: %w", err)
 	}
@@ -785,12 +759,11 @@ func closeFiles(files ...*os.File) {
 	}
 }
 
-func writeLine(dest io.Writer, line string) error {
+func writeLine(dest io.Writer, line string, mu *sync.Mutex) error {
 	buf := make([]byte, len(line)+1)
 	copy(buf, line)
 	buf[len(line)] = '\n'
 
-	mu := mutexForWriter(dest)
 	mu.Lock()
 	defer mu.Unlock()
 	_, err := dest.Write(buf)

@@ -498,6 +498,34 @@ func TestSharedWriterWithOneFormatter(t *testing.T) {
 	}
 }
 
+// valueSharedWriter is a non-pointer Writer that shares an underlying buffer.
+type valueSharedWriter struct{ w *overlapWriter }
+
+func (w valueSharedWriter) Write(b []byte) (int, error) { return w.w.Write(b) }
+
+func TestSharedValueWriterStdoutStderr(t *testing.T) {
+	var output overlapWriter
+	shared := valueSharedWriter{w: &output}
+	err := Run(Config{
+		Command:         "sh",
+		Args:            []string{"-c", `i=0; while [ "$i" -lt 100 ]; do echo out; echo err >&2; i=$((i+1)); done`},
+		Stdout:          shared,
+		Stderr:          shared,
+		StdoutFormatter: func(s string) string { return s },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output.overlapped.Load() {
+		t.Error("shared value Writer received concurrent writes")
+	}
+	for _, line := range []string{"out\n", "err\n"} {
+		if got := strings.Count(output.buf.String(), line); got != 100 {
+			t.Errorf("output contains %d copies of %q, want 100", got, line)
+		}
+	}
+}
+
 type blockingWriter struct {
 	ready chan struct{}
 	block chan struct{}
@@ -612,7 +640,7 @@ func TestDistinctWritersDoNotShareLock(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("distinct Writer blocked behind unrelated process lock")
+		t.Fatal("distinct Process blocked behind unrelated process output lock")
 	}
 	if got := fast.String(); got != "fast\n" {
 		t.Fatalf("stdout = %q", got)
