@@ -18,7 +18,7 @@ func TestCancelWithBlockedStdin(t *testing.T) {
 	defer w.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, err := New(&Config{Command: "sleep", Args: []string{"30"}, Stdin: r, Stdout: io.Discard, Stderr: io.Discard, StopTimeout: 20 * time.Millisecond})
+	p, err := New(Config{Command: "sleep", Args: []string{"30"}, Stdin: r, Stdout: io.Discard, Stderr: io.Discard, StopTimeout: 20 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestExitWithBlockedStdin(t *testing.T) {
 	defer w.Close()
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(&Config{Command: "sh", Args: []string{"-c", "exit 0"}, Stdin: r, Stdout: io.Discard, Stderr: io.Discard})
+		done <- Run(Config{Command: "sh", Args: []string{"-c", "exit 0"}, Stdin: r, Stdout: io.Discard, Stderr: io.Discard})
 	}()
 	select {
 	case err := <-done:
@@ -66,7 +66,7 @@ func TestExitWithBlockedStdin(t *testing.T) {
 func TestStdinTransfer(t *testing.T) {
 	input := bytes.Repeat([]byte{'a', 0, 'b', '\n'}, 32768)
 	var output bytes.Buffer
-	err := Run(&Config{Command: "cat", Stdin: bytes.NewReader(input), Stdout: &output, Stderr: io.Discard})
+	err := Run(Config{Command: "cat", Stdin: bytes.NewReader(input), Stdout: &output, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func (r failingInput) Read([]byte) (int, error) { return 0, r.err }
 
 func TestStdinError(t *testing.T) {
 	want := errors.New("input failed")
-	err := Run(&Config{Command: "cat", Stdin: failingInput{want}, Stdout: io.Discard, Stderr: io.Discard})
+	err := Run(Config{Command: "cat", Stdin: failingInput{want}, Stdout: io.Discard, Stderr: io.Discard})
 	if !errors.Is(err, want) {
 		t.Fatalf("Run = %v, want %v", err, want)
 	}
@@ -94,7 +94,7 @@ func TestBlockedStdinSurvivesRestart(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "started")
 	script := fmt.Sprintf("if [ ! -f %q ]; then touch %q; exit 1; fi; cat", marker, marker)
 	var output bytes.Buffer
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "sh", Args: []string{"-c", script},
 		Stdin: r, Stdout: &output, Stderr: io.Discard,
 		RestartPolicy: RestartOnFail, MaxRestarts: 1,
@@ -141,7 +141,7 @@ func (r *observedInput) Read([]byte) (int, error) {
 
 func TestStartFailureDoesNotReadStdin(t *testing.T) {
 	r := &observedInput{}
-	err := Run(&Config{Command: filepath.Join(t.TempDir(), "missing"), Stdin: r})
+	err := Run(Config{Command: filepath.Join(t.TempDir(), "missing"), Stdin: r})
 	if err == nil {
 		t.Fatal("expected start failure")
 	}
@@ -161,7 +161,7 @@ func (r *recoveringInput) Read([]byte) (int, error) {
 }
 
 func TestRestartRecoversFromStdinError(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "cat", Stdin: &recoveringInput{}, Stdout: io.Discard, Stderr: io.Discard,
 		RestartPolicy: RestartOnFail, MaxRestarts: 1, RestartDelay: time.Millisecond,
 	})

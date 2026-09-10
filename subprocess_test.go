@@ -16,16 +16,13 @@ import (
 )
 
 func TestNewValidation(t *testing.T) {
-	if _, err := New(nil); err == nil {
-		t.Fatal("expected error for nil config")
-	}
-	if _, err := New(&Config{}); err == nil {
+	if _, err := New(Config{}); err == nil {
 		t.Fatal("expected error for empty command")
 	}
 }
 
 func TestNewDoesNotMutateConfig(t *testing.T) {
-	cfg := &Config{Command: "echo", Args: []string{"hi"}}
+	cfg := Config{Command: "echo", Args: []string{"hi"}}
 	if _, err := New(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +36,7 @@ func TestNewDoesNotMutateConfig(t *testing.T) {
 
 func TestRunEcho(t *testing.T) {
 	var buf bytes.Buffer
-	err := Run(&Config{
+	err := Run(Config{
 		Command: "echo",
 		Args:    []string{"hello"},
 		Stdout:  &buf,
@@ -58,7 +55,7 @@ func TestEmptyEnvIsNotInherited(t *testing.T) {
 	t.Setenv(key, "inherited")
 
 	env := []string{}
-	p, err := New(&Config{Command: "sh", Env: env})
+	p, err := New(Config{Command: "sh", Env: env})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +68,7 @@ func TestEmptyEnvIsNotInherited(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	err = Run(&Config{
+	err = Run(Config{
 		Command: "sh",
 		Args:    []string{"-c", "printf %s \"$" + key + "\""},
 		Env:     []string{},
@@ -91,7 +88,7 @@ func TestNilEnvInherits(t *testing.T) {
 	t.Setenv(key, "inherited")
 
 	var buf bytes.Buffer
-	err := Run(&Config{
+	err := Run(Config{
 		Command: "sh",
 		Args:    []string{"-c", "printf %s \"$" + key + "\""},
 		Stdout:  &buf,
@@ -110,7 +107,7 @@ func TestSlowFormatterKeepsSuccessfulOutput(t *testing.T) {
 	script := fmt.Sprintf(`i=1; while [ "$i" -le %d ]; do echo "out-$i"; echo "err-$i" >&2; i=$((i+1)); done`, n)
 
 	var stdout, stderr bytes.Buffer
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "sh",
 		Args:    []string{"-c", script},
 		Stdout:  &stdout,
@@ -150,7 +147,7 @@ func TestSlowFormatterKeepsSuccessfulOutput(t *testing.T) {
 
 func TestFormatterAndLongLine(t *testing.T) {
 	var buf bytes.Buffer
-	err := Run(&Config{
+	err := Run(Config{
 		Command: "echo",
 		Args:    []string{"hello"},
 		Stdout:  &buf,
@@ -168,7 +165,7 @@ func TestFormatterAndLongLine(t *testing.T) {
 
 	line := strings.Repeat("a", 70*1024)
 	buf.Reset()
-	err = Run(&Config{
+	err = Run(Config{
 		Command: "sh",
 		Args:    []string{"-c", "printf '%s\n' \"$1\"", "sh", line},
 		Stdout:  &buf,
@@ -186,7 +183,7 @@ func TestFormatterAndLongLine(t *testing.T) {
 }
 
 func TestStartFailure(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: filepath.Join(t.TempDir(), "missing-binary"),
 		Stdout:  io.Discard,
 		Stderr:  io.Discard,
@@ -210,7 +207,7 @@ func TestStartFailure(t *testing.T) {
 }
 
 func TestWaitBeforeStart(t *testing.T) {
-	p, err := New(&Config{Command: "echo", Stdout: io.Discard, Stderr: io.Discard})
+	p, err := New(Config{Command: "echo", Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +217,7 @@ func TestWaitBeforeStart(t *testing.T) {
 }
 
 func TestDoubleStart(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "sleep",
 		Args:    []string{"5"},
 		Stdout:  io.Discard,
@@ -243,7 +240,7 @@ func TestDoubleStart(t *testing.T) {
 
 func TestContextCancel(t *testing.T) {
 	var onError int
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "sleep",
 		Args:    []string{"30"},
 		Stdout:  io.Discard,
@@ -284,7 +281,7 @@ func TestDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "sleep",
 		Args:    []string{"30"},
 		Stdout:  io.Discard,
@@ -312,7 +309,7 @@ func TestRestartOnFailThenSuccessClearsError(t *testing.T) {
 		errorsN  int
 		restarts []int
 	)
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:        "sh",
 		Args:           []string{"-c", script},
 		Stdout:         io.Discard,
@@ -357,7 +354,7 @@ func TestRestartOnFailThenSuccessClearsError(t *testing.T) {
 }
 
 func TestMaxRestarts(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:        "sh",
 		Args:           []string{"-c", "exit 1"},
 		Stdout:         io.Discard,
@@ -391,7 +388,7 @@ func TestMaxRestarts(t *testing.T) {
 }
 
 func TestRestartNever(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:       "sh",
 		Args:          []string{"-c", "exit 1"},
 		Stdout:        io.Discard,
@@ -473,7 +470,7 @@ func TestSharedWriterWithOneFormatter(t *testing.T) {
 	for _, stream := range []string{"stdout", "stderr"} {
 		t.Run(stream, func(t *testing.T) {
 			var output overlapWriter
-			cfg := &Config{
+			cfg := Config{
 				Command: "sh",
 				Args:    []string{"-c", `i=0; while [ "$i" -lt 100 ]; do echo out; echo err >&2; i=$((i+1)); done`},
 				Stdout:  &output,
@@ -524,7 +521,7 @@ func TestCancelWithBlockedOutputWriter(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:         "sh",
 		Args:            []string{"-c", "echo hello; sleep 30"},
 		Stdout:          w,
@@ -566,7 +563,7 @@ func TestDistinctWritersDoNotShareLock(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:         "sh",
 		Args:            []string{"-c", "echo slow; sleep 30"},
 		Stdout:          slow,
@@ -589,7 +586,7 @@ func TestDistinctWritersDoNotShareLock(t *testing.T) {
 	var fast bytes.Buffer
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(&Config{
+		done <- Run(Config{
 			Command:         "echo",
 			Args:            []string{"fast"},
 			Stdout:          &fast,

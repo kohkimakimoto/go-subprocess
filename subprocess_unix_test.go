@@ -32,7 +32,7 @@ func TestCancelKillsProcessGroup(t *testing.T) {
 	pidFile := filepath.Join(dir, "child.pid")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:     os.Args[0],
 		Env:         helperEnv("parent", pidFile),
 		Stdout:      io.Discard,
@@ -73,7 +73,7 @@ func TestCancelKillsDescendantsThatIgnoreStopSignal(t *testing.T) {
 	pidFile := filepath.Join(dir, "child.pid")
 
 	ctx, cancel := context.WithCancel(context.Background())
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:     os.Args[0],
 		Env:         helperEnv("parent-ignore", pidFile),
 		Stdout:      io.Discard,
@@ -133,7 +133,7 @@ func runHelper(role string) {
 			os.Exit(1)
 		}
 		if role == "parent-exit" {
-			// An optional argument makes the unformatted copier fail before exit.
+			// Optional arg selects which stream gets a line before exit.
 			if len(os.Args) > 1 {
 				if os.Args[1] == "stdout" {
 					fmt.Fprintln(os.Stdout, "writer-error")
@@ -198,7 +198,7 @@ func TestCancelWhileDrainingDescendantOutput(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), "child.pid")
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			cfg := &Config{
+			cfg := Config{
 				Command:     os.Args[0],
 				Env:         helperEnv("parent-exit", pidFile),
 				Stdout:      os.Stdout,
@@ -272,7 +272,7 @@ func TestCancelAfterOutputWriterContextError(t *testing.T) {
 				pidFile := filepath.Join(t.TempDir(), "child.pid")
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				cfg := &Config{
+				cfg := Config{
 					Command:     os.Args[0],
 					Args:        []string{stream},
 					Env:         helperEnv("parent-exit", pidFile),

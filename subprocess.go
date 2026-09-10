@@ -40,17 +40,17 @@ const (
 // The line does not include the trailing newline.
 type LogFormatter func(line string) string
 
-// Config contains all configuration for a subprocess.
-// New copies Config, so later changes to the original value are not observed.
-// Args and Env are copied; do not mutate them after Start.
+// Config holds subprocess settings for New, Run, and RunWithContext.
+// It is passed by value. Args and Env are deep-copied; Stdin, Stdout, Stderr,
+// and callbacks are shared references.
 type Config struct {
 	Command         string
 	Args            []string
 	StdoutFormatter LogFormatter
 	StderrFormatter LogFormatter
 	// Stdin is the process standard input. Nil means the null device, not os.Stdin.
-	// The caller owns Stdin; it is never closed by Process. For a non-file Reader,
-	// a blocked Read may outlive Wait until the caller unblocks or closes it.
+	// The caller owns Stdin and closes it if needed. For a non-file Reader, a
+	// blocked Read may outlive Wait until the caller unblocks or closes it.
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
@@ -72,7 +72,8 @@ type Config struct {
 	RestartBackoff float64
 	// RestartDelayMax caps the restart delay. The zero value is 30s.
 	RestartDelayMax time.Duration
-	// StopTimeout is how long to wait after StopSignal before killing the process.
+	// StopTimeout bounds waiting for the process group after StopSignal, and
+	// separately bounds draining formatted output after shutdown or cancellation.
 	// The zero value is 10s.
 	StopTimeout time.Duration
 	// StopSignal is sent on context cancellation. The zero value is os.Interrupt.
@@ -108,49 +109,44 @@ var ErrNotStarted = errors.New("subprocess: not started")
 // ErrAlreadyStarted is returned by Start when the process was already started.
 var ErrAlreadyStarted = errors.New("subprocess: already started")
 
-// New creates a managed process. It copies config and fills defaults.
-func New(c *Config) (*Process, error) {
-	if c == nil {
-		return nil, errors.New("subprocess: config is nil")
-	}
+// New creates a managed process. It snapshots c and fills defaults.
+func New(c Config) (*Process, error) {
 	if c.Command == "" {
 		return nil, errors.New("subprocess: command is empty")
 	}
 
-	cfg := *c
-	// make+copy keeps a non-nil empty slice empty. append onto nil turns it into nil,
-	// and a nil Env means inherit the parent environment.
-	cfg.Args = copyStrings(c.Args)
-	cfg.Env = copyStrings(c.Env)
-	if cfg.Stdout == nil {
-		cfg.Stdout = os.Stdout
+	// Deep-copy so Env keeps nil vs empty distinct (nil inherits the parent env).
+	c.Args = copyStrings(c.Args)
+	c.Env = copyStrings(c.Env)
+	if c.Stdout == nil {
+		c.Stdout = os.Stdout
 	}
-	if cfg.Stderr == nil {
-		cfg.Stderr = os.Stderr
+	if c.Stderr == nil {
+		c.Stderr = os.Stderr
 	}
-	if cfg.RestartPolicy == "" {
-		cfg.RestartPolicy = RestartNever
+	if c.RestartPolicy == "" {
+		c.RestartPolicy = RestartNever
 	}
-	if cfg.RestartDelay <= 0 {
-		cfg.RestartDelay = defaultRestartDelay
+	if c.RestartDelay <= 0 {
+		c.RestartDelay = defaultRestartDelay
 	}
-	if cfg.RestartBackoff == 0 {
-		cfg.RestartBackoff = defaultRestartBackoff
-	} else if cfg.RestartBackoff < 1 {
-		cfg.RestartBackoff = 1
+	if c.RestartBackoff == 0 {
+		c.RestartBackoff = defaultRestartBackoff
+	} else if c.RestartBackoff < 1 {
+		c.RestartBackoff = 1
 	}
-	if cfg.RestartDelayMax <= 0 {
-		cfg.RestartDelayMax = defaultRestartDelayMax
+	if c.RestartDelayMax <= 0 {
+		c.RestartDelayMax = defaultRestartDelayMax
 	}
-	if cfg.StopTimeout <= 0 {
-		cfg.StopTimeout = defaultStopTimeout
+	if c.StopTimeout <= 0 {
+		c.StopTimeout = defaultStopTimeout
 	}
-	if cfg.StopSignal == nil {
-		cfg.StopSignal = os.Interrupt
+	if c.StopSignal == nil {
+		c.StopSignal = os.Interrupt
 	}
 
 	return &Process{
-		config: cfg,
+		config: c,
 		done:   make(chan struct{}),
 	}, nil
 }
@@ -236,8 +232,7 @@ func (p *Process) supervise(ctx context.Context) {
 			return
 		}
 
-		// Keep one input pump across restarts. A pending Read must not compete
-		// with another run for the same caller-owned Reader.
+		// One input pump across restarts so a pending Read stays on a single Reader.
 		if input == nil && p.config.Stdin != nil {
 			if _, isFile := p.config.Stdin.(*os.File); !isFile {
 				var err error
@@ -302,7 +297,7 @@ func (p *Process) restartDelay() time.Duration {
 	if backoff < 1 {
 		backoff = 1
 	}
-	// A multiplier of 1 is a fixed delay. Do not treat next == d as overflow.
+	// A multiplier of 1 is a fixed delay (next == d is not overflow).
 	if backoff == 1 {
 		if maxDelay > 0 && delay > maxDelay {
 			return maxDelay
@@ -352,9 +347,9 @@ func (p *Process) shouldRestart(err error) bool {
 	}
 }
 
-// managedInput owns the pipe, but not the source Reader. Its pump may remain
-// blocked in the source after shutdown; closing our files releases all owned
-// descriptors and prevents subsequent writes. At most one pump exists per Process.
+// managedInput is the stdin pipe shared across restarts. The source Reader stays
+// caller-owned; the pump may still be blocked in that Reader after Wait returns.
+// At most one pump exists per Process.
 type managedInput struct {
 	reader, writer *os.File
 	done           chan struct{}
@@ -377,7 +372,7 @@ func (in *managedInput) start(src io.Reader) {
 	in.started = true
 	go func() {
 		_, in.err = io.Copy(in.writer, src)
-		// Publish errors before closing the pipe lets the child observe EOF.
+		// Close done before the writer so waiters see err before the child sees EOF.
 		close(in.done)
 		closeFiles(in.writer)
 	}()
@@ -394,14 +389,12 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 	cmd.Stdin = p.config.Stdin
 	configureSysProcAttr(cmd)
 
-	// Give exec a file so cmd.Wait does not wait for a caller-owned Reader's
-	// potentially uninterruptible Read. The supervisor owns the pipe's lifetime.
+	// Feed stdin from our pipe so Wait is independent of the caller's Reader.
 	if input != nil {
 		cmd.Stdin = input.reader
 	}
 
-	// Own the pipes. StdoutPipe/StderrPipe are closed by cmd.Wait, which drops
-	// unread output and makes a slow formatter fail a successful exit.
+	// Formatter pipes are process-owned so scanners can keep reading after Wait.
 	var stdoutR, stdoutW *os.File
 	var stderrR, stderrW *os.File
 	var err error
@@ -470,9 +463,8 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 		wg.Wait()
 		close(outputDone)
 	}()
-	// The child may have exited while descendants still hold the output pipes.
-	// After shutdown, bound the drain so a stuck pipe or blocked Writer cannot
-	// keep Wait hanging after cancellation.
+	// Descendants may still hold output pipes after the direct child exits.
+	// Bound the drain after shutdown/cancellation so Wait can return.
 	abandoned := false
 	if shutdown {
 		abandoned = waitOutputDrain(outputDone, p.config.StopTimeout, stdoutR, stderrR)
@@ -487,8 +479,7 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 
 	var scanErr error
 	if abandoned {
-		// Scanners may still be blocked in a destination Write; take only
-		// errors already reported and return so Wait can unblock.
+		// Destination Write may still be blocked; collect only ready scan errors.
 		scanErr = takeReadyErrors(errCh)
 	} else {
 		close(errCh)
@@ -496,7 +487,7 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 			scanErr = errors.Join(scanErr, e)
 		}
 	}
-	// Preserve completed input errors, but never wait for a blocked Reader.
+	// Surface a finished input error without waiting on a blocked Reader.
 	if input != nil && waitErr == nil {
 		select {
 		case <-input.done:
@@ -531,8 +522,7 @@ func (p *Process) waitOrShutdown(ctx context.Context, cmd *exec.Cmd) (err error,
 		if ctx.Err() == nil {
 			return err, false
 		}
-		// Cancellation won the race with the child's exit. Descendants may
-		// still be alive and have not been signaled.
+		// Context is already canceled; still shut down remaining group members.
 		return p.shutdownGroup(ctx, cmd, nil, true, err), true
 	case <-ctx.Done():
 		return p.shutdownGroup(ctx, cmd, waitDone, false, nil), true
@@ -540,9 +530,8 @@ func (p *Process) waitOrShutdown(ctx context.Context, cmd *exec.Cmd) (err error,
 }
 
 // shutdownGroup signals the process group and waits until the direct child and
-// the rest of the group are gone, or StopTimeout elapses. Child exit alone is
-// not enough: a parent that dies on the stop signal leaves descendants that
-// ignore it. waitDone is nil when the child has already been waited.
+// any remaining members are gone, or StopTimeout elapses. waitDone is nil when
+// the child has already been waited.
 func (p *Process) shutdownGroup(ctx context.Context, cmd *exec.Cmd, waitDone <-chan error, childExited bool, waitErr error) error {
 	if err := signalProcess(cmd, p.config.StopSignal); err != nil {
 		killProcess(cmd)
@@ -604,8 +593,8 @@ func (p *Process) shutdownGroup(ctx context.Context, cmd *exec.Cmd, waitDone <-c
 	}
 }
 
-// waitForProcessGroup waits until a just-sent SIGKILL has reaped the group.
-// Processes in uninterruptible sleep can linger; do not block forever.
+// waitForProcessGroup waits briefly for the group to disappear after SIGKILL.
+// Processes in uninterruptible sleep may outlive this bound.
 func waitForProcessGroup(cmd *exec.Cmd) {
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for processGroupAlive(cmd) && time.Now().Before(deadline) {
@@ -614,9 +603,8 @@ func waitForProcessGroup(cmd *exec.Cmd) {
 }
 
 // waitOutputDrain waits for formatted output scanners to finish. On timeout it
-// closes the pipe read ends so a scanner blocked on Read can exit. If a
-// scanner is stuck in a destination Write, it abandons the wait so Wait can
-// return after shutdown/cancellation.
+// closes the pipe read ends and, after a short grace period, returns whether
+// the wait was abandoned (scanner likely blocked in a destination Write).
 func waitOutputDrain(done <-chan struct{}, timeout time.Duration, pipes ...*os.File) bool {
 	if timeout <= 0 {
 		timeout = defaultStopTimeout
@@ -689,8 +677,8 @@ func combineRunError(waitErr, scanErr error) error {
 	return fmt.Errorf("%w; output: %v", waitErr, scanErr)
 }
 
-// writerLocks holds a mutex per destination Writer identity so shared Writers
-// are safe across streams and processes, without serializing unrelated writers.
+// writerLocks maps destination Writer pointer identity to a mutex so shared
+// Writers are serialized across streams and processes.
 var writerLocks sync.Map // uintptr -> *sync.Mutex
 
 type lockedWriter struct{ dest io.Writer }
@@ -703,16 +691,15 @@ func (w lockedWriter) Write(b []byte) (int, error) {
 }
 
 func outputWriter(dest io.Writer) io.Writer {
-	// Keep files connected directly to the child, preserving file semantics.
+	// *os.File keeps OS file semantics when connected directly to the child.
 	if _, ok := dest.(*os.File); ok {
 		return dest
 	}
 	return lockedWriter{dest: dest}
 }
 
-// mutexForWriter returns a lock for dest based on its pointer identity.
-// Distinct Writer values do not share a lock. Non-pointer Writers get a
-// private mutex (no cross-process sharing for that value).
+// mutexForWriter returns the lock for dest's pointer identity.
+// Non-pointer Writers get a private mutex for that call only.
 func mutexForWriter(dest io.Writer) *sync.Mutex {
 	if dest == nil {
 		mu := &sync.Mutex{}
@@ -791,12 +778,12 @@ func writeLine(dest io.Writer, line string) error {
 
 // Run executes a subprocess and waits for it to finish.
 // An empty RestartPolicy is RestartNever.
-func Run(config *Config) error {
+func Run(config Config) error {
 	return RunWithContext(context.Background(), config)
 }
 
 // RunWithContext executes a subprocess with ctx and waits for it to finish.
-func RunWithContext(ctx context.Context, config *Config) error {
+func RunWithContext(ctx context.Context, config Config) error {
 	process, err := New(config)
 	if err != nil {
 		return err

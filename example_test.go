@@ -11,7 +11,7 @@ import (
 )
 
 func ExampleRun() {
-	config := &subprocess.Config{
+	config := subprocess.Config{
 		Command: "echo",
 		Args:    []string{"Hello, World!"},
 	}
@@ -24,7 +24,7 @@ func ExampleRun() {
 }
 
 func ExampleConfig_stdoutFormatter() {
-	config := &subprocess.Config{
+	config := subprocess.Config{
 		Command: "echo",
 		Args:    []string{"test message"},
 		StdoutFormatter: func(line string) string {
@@ -40,7 +40,7 @@ func ExampleProcess_timeout() {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	config := &subprocess.Config{
+	config := subprocess.Config{
 		Command: "sleep",
 		Args:    []string{"10"},
 		Stdout:  io.Discard,
