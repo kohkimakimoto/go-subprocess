@@ -88,6 +88,80 @@ Shell background jobs often ignore `SIGINT` and `SIGTERM`; those descendants are
 `StopTimeout` also bounds how long output is drained after shutdown or cancellation.
 Non-file Writers are copied through process-owned pipes so `Wait` is not tied to a blocked `Write`; a blocked write may still outlive `Wait` after that bound.
 
+### Run a subprocess alongside an HTTP server
+
+A typical use case: a Go HTTP server manages an auxiliary process such as `npm run dev`.
+Both share one context so the child stops when the application shuts down.
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/kohkimakimoto/go-subprocess"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dev, err := subprocess.New(subprocess.Config{
+		Command:       "npm",
+		Args:          []string{"run", "dev"},
+		RestartPolicy: subprocess.RestartOnFail,
+		StopTimeout:   10 * time.Second,
+		StopSignal:    os.Interrupt,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := dev.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+
+	devDone := make(chan error, 1)
+	go func() { devDone <- dev.Wait() }()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	srv := &http.Server{Addr: ":8080", Handler: mux}
+
+	go func() {
+		log.Printf("http listening on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("http error: %v", err)
+			cancel()
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+	log.Print("shutting down")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
+
+	cancel()
+	if err := <-devDone; err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("npm: %v", err)
+	}
+}
+```
+
 ### Format output
 
 With a formatter, output is scanned line by line.
