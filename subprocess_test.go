@@ -10,21 +10,19 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestNewValidation(t *testing.T) {
-	if _, err := New(nil); err == nil {
-		t.Fatal("expected error for nil config")
-	}
-	if _, err := New(&Config{}); err == nil {
+	if _, err := New(Config{}); err == nil {
 		t.Fatal("expected error for empty command")
 	}
 }
 
 func TestNewDoesNotMutateConfig(t *testing.T) {
-	cfg := &Config{Command: "echo", Args: []string{"hi"}}
+	cfg := Config{Command: "echo", Args: []string{"hi"}}
 	if _, err := New(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +36,7 @@ func TestNewDoesNotMutateConfig(t *testing.T) {
 
 func TestRunEcho(t *testing.T) {
 	var buf bytes.Buffer
-	err := Run(&Config{
+	err := Run(Config{
 		Command: "echo",
 		Args:    []string{"hello"},
 		Stdout:  &buf,
@@ -52,9 +50,104 @@ func TestRunEcho(t *testing.T) {
 	}
 }
 
+func TestEmptyEnvIsNotInherited(t *testing.T) {
+	const key = "GO_SUBPROCESS_EMPTY_ENV"
+	t.Setenv(key, "inherited")
+
+	env := []string{}
+	p, err := New(Config{Command: "sh", Env: env})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.config.Env == nil {
+		t.Fatal("empty Env became nil")
+	}
+	env = append(env, key+"=leaked")
+	if len(p.config.Env) != 0 {
+		t.Fatal("Env aliases the caller slice")
+	}
+
+	var buf bytes.Buffer
+	err = Run(Config{
+		Command: "sh",
+		Args:    []string{"-c", "printf %s \"$" + key + "\""},
+		Env:     []string{},
+		Stdout:  &buf,
+		Stderr:  io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("empty Env inherited %s=%q", key, got)
+	}
+}
+
+func TestNilEnvInherits(t *testing.T) {
+	const key = "GO_SUBPROCESS_NIL_ENV"
+	t.Setenv(key, "inherited")
+
+	var buf bytes.Buffer
+	err := Run(Config{
+		Command: "sh",
+		Args:    []string{"-c", "printf %s \"$" + key + "\""},
+		Stdout:  &buf,
+		Stderr:  io.Discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); got != "inherited" {
+		t.Fatalf("nil Env = %q, want inherited", got)
+	}
+}
+
+func TestSlowFormatterKeepsSuccessfulOutput(t *testing.T) {
+	const n = 200
+	script := fmt.Sprintf(`i=1; while [ "$i" -le %d ]; do echo "out-$i"; echo "err-$i" >&2; i=$((i+1)); done`, n)
+
+	var stdout, stderr bytes.Buffer
+	p, err := New(Config{
+		Command: "sh",
+		Args:    []string{"-c", script},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+		StdoutFormatter: func(line string) string {
+			time.Sleep(time.Millisecond)
+			return line
+		},
+		StderrFormatter: func(line string) string {
+			time.Sleep(time.Millisecond)
+			return line
+		},
+		RestartPolicy:  RestartOnFail,
+		MaxRestarts:    1,
+		RestartDelay:   10 * time.Millisecond,
+		RestartBackoff: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if p.RestartCount() != 0 {
+		t.Fatalf("restarts = %d, want 0", p.RestartCount())
+	}
+	if got := strings.Count(stdout.String(), "\n"); got != n {
+		t.Fatalf("stdout lines = %d, want %d", got, n)
+	}
+	if got := strings.Count(stderr.String(), "\n"); got != n {
+		t.Fatalf("stderr lines = %d, want %d", got, n)
+	}
+}
+
 func TestFormatterAndLongLine(t *testing.T) {
 	var buf bytes.Buffer
-	err := Run(&Config{
+	err := Run(Config{
 		Command: "echo",
 		Args:    []string{"hello"},
 		Stdout:  &buf,
@@ -72,7 +165,7 @@ func TestFormatterAndLongLine(t *testing.T) {
 
 	line := strings.Repeat("a", 70*1024)
 	buf.Reset()
-	err = Run(&Config{
+	err = Run(Config{
 		Command: "sh",
 		Args:    []string{"-c", "printf '%s\n' \"$1\"", "sh", line},
 		Stdout:  &buf,
@@ -90,7 +183,7 @@ func TestFormatterAndLongLine(t *testing.T) {
 }
 
 func TestStartFailure(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: filepath.Join(t.TempDir(), "missing-binary"),
 		Stdout:  io.Discard,
 		Stderr:  io.Discard,
@@ -114,7 +207,7 @@ func TestStartFailure(t *testing.T) {
 }
 
 func TestWaitBeforeStart(t *testing.T) {
-	p, err := New(&Config{Command: "echo", Stdout: io.Discard, Stderr: io.Discard})
+	p, err := New(Config{Command: "echo", Stdout: io.Discard, Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +217,7 @@ func TestWaitBeforeStart(t *testing.T) {
 }
 
 func TestDoubleStart(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "sleep",
 		Args:    []string{"5"},
 		Stdout:  io.Discard,
@@ -147,7 +240,7 @@ func TestDoubleStart(t *testing.T) {
 
 func TestContextCancel(t *testing.T) {
 	var onError int
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "sleep",
 		Args:    []string{"30"},
 		Stdout:  io.Discard,
@@ -188,7 +281,7 @@ func TestDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command: "sleep",
 		Args:    []string{"30"},
 		Stdout:  io.Discard,
@@ -216,7 +309,7 @@ func TestRestartOnFailThenSuccessClearsError(t *testing.T) {
 		errorsN  int
 		restarts []int
 	)
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:        "sh",
 		Args:           []string{"-c", script},
 		Stdout:         io.Discard,
@@ -261,7 +354,7 @@ func TestRestartOnFailThenSuccessClearsError(t *testing.T) {
 }
 
 func TestMaxRestarts(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:        "sh",
 		Args:           []string{"-c", "exit 1"},
 		Stdout:         io.Discard,
@@ -295,7 +388,7 @@ func TestMaxRestarts(t *testing.T) {
 }
 
 func TestRestartNever(t *testing.T) {
-	p, err := New(&Config{
+	p, err := New(Config{
 		Command:       "sh",
 		Args:          []string{"-c", "exit 1"},
 		Stdout:        io.Discard,
@@ -352,4 +445,207 @@ func waitUntilRunning(t *testing.T, p *Process) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("process did not start")
+}
+
+// overlapWriter detects concurrent calls without introducing a test-side data race.
+type overlapWriter struct {
+	active     atomic.Int32
+	overlapped atomic.Bool
+	mu         sync.Mutex
+	buf        bytes.Buffer
+}
+
+func (w *overlapWriter) Write(b []byte) (int, error) {
+	if w.active.Add(1) > 1 {
+		w.overlapped.Store(true)
+	}
+	defer w.active.Add(-1)
+	time.Sleep(time.Millisecond)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(b)
+}
+
+func TestSharedWriterWithOneFormatter(t *testing.T) {
+	for _, mode := range []string{"stdout-formatter", "stderr-formatter", "raw"} {
+		t.Run(mode, func(t *testing.T) {
+			var output overlapWriter
+			cfg := Config{
+				Command: "sh",
+				Args:    []string{"-c", `i=0; while [ "$i" -lt 100 ]; do echo out; echo err >&2; i=$((i+1)); done`},
+				Stdout:  &output,
+				Stderr:  &output,
+			}
+			formatter := func(s string) string { return s }
+			switch mode {
+			case "stdout-formatter":
+				cfg.StdoutFormatter = formatter
+			case "stderr-formatter":
+				cfg.StderrFormatter = formatter
+			}
+			if err := Run(cfg); err != nil {
+				t.Fatal(err)
+			}
+			if output.overlapped.Load() {
+				t.Error("shared Writer received concurrent writes")
+			}
+			for _, line := range []string{"out\n", "err\n"} {
+				if got := strings.Count(output.buf.String(), line); got != 100 {
+					t.Errorf("output contains %d copies of %q, want 100", got, line)
+				}
+			}
+		})
+	}
+}
+
+// valueSharedWriter is a non-pointer Writer that shares an underlying buffer.
+type valueSharedWriter struct{ w *overlapWriter }
+
+func (w valueSharedWriter) Write(b []byte) (int, error) { return w.w.Write(b) }
+
+func TestSharedValueWriterStdoutStderr(t *testing.T) {
+	var output overlapWriter
+	shared := valueSharedWriter{w: &output}
+	err := Run(Config{
+		Command:         "sh",
+		Args:            []string{"-c", `i=0; while [ "$i" -lt 100 ]; do echo out; echo err >&2; i=$((i+1)); done`},
+		Stdout:          shared,
+		Stderr:          shared,
+		StdoutFormatter: func(s string) string { return s },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output.overlapped.Load() {
+		t.Error("shared value Writer received concurrent writes")
+	}
+	for _, line := range []string{"out\n", "err\n"} {
+		if got := strings.Count(output.buf.String(), line); got != 100 {
+			t.Errorf("output contains %d copies of %q, want 100", got, line)
+		}
+	}
+}
+
+type blockingWriter struct {
+	ready chan struct{}
+	block chan struct{}
+}
+
+func (w *blockingWriter) Write(b []byte) (int, error) {
+	select {
+	case <-w.ready:
+	default:
+		close(w.ready)
+	}
+	<-w.block
+	return len(b), nil
+}
+
+func TestCancelWithBlockedOutputWriter(t *testing.T) {
+	for _, withFormatter := range []bool{false, true} {
+		name := "raw"
+		if withFormatter {
+			name = "formatter"
+		}
+		t.Run(name, func(t *testing.T) {
+			w := &blockingWriter{
+				ready: make(chan struct{}),
+				block: make(chan struct{}),
+			}
+			defer close(w.block)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cfg := Config{
+				Command:     "sh",
+				Args:        []string{"-c", "echo hello; sleep 30"},
+				Stdout:      w,
+				Stderr:      io.Discard,
+				StopTimeout: 50 * time.Millisecond,
+			}
+			if withFormatter {
+				cfg.StdoutFormatter = func(s string) string { return s }
+			}
+			p, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-w.ready:
+			case <-time.After(2 * time.Second):
+				t.Fatal("writer was not called")
+			}
+
+			done := make(chan error, 1)
+			go func() { done <- p.Wait() }()
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Wait = %v, want context.Canceled", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Wait blocked on output Writer after cancellation")
+			}
+		})
+	}
+}
+
+func TestDistinctWritersDoNotShareLock(t *testing.T) {
+	slow := &blockingWriter{
+		ready: make(chan struct{}),
+		block: make(chan struct{}),
+	}
+	defer close(slow.block)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p, err := New(Config{
+		Command:         "sh",
+		Args:            []string{"-c", "echo slow; sleep 30"},
+		Stdout:          slow,
+		Stderr:          io.Discard,
+		StdoutFormatter: func(s string) string { return s },
+		StopTimeout:     50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-slow.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow writer was not called")
+	}
+
+	var fast bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Config{
+			Command:         "echo",
+			Args:            []string{"fast"},
+			Stdout:          &fast,
+			Stderr:          io.Discard,
+			StdoutFormatter: func(s string) string { return s },
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("distinct Process blocked behind unrelated process output lock")
+	}
+	if got := fast.String(); got != "fast\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+
+	cancel()
+	_ = p.Wait()
 }

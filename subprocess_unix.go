@@ -3,6 +3,7 @@
 package subprocess
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"syscall"
@@ -20,9 +21,7 @@ func signalProcess(cmd *exec.Cmd, sig os.Signal) error {
 		return nil
 	}
 	if s, ok := sig.(syscall.Signal); ok {
-		// Signal the process group so descendants receive the same signal.
-		// Children started as shell background jobs often ignore SIGINT/SIGTERM;
-		// killProcess sends SIGKILL to the group after StopTimeout.
+		// Signal the whole process group, including descendants.
 		if err := syscall.Kill(-cmd.Process.Pid, s); err == nil {
 			return nil
 		}
@@ -36,4 +35,13 @@ func killProcess(cmd *exec.Cmd) {
 	}
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	_ = cmd.Process.Kill()
+}
+
+// processGroupAlive reports whether any process remains in the child's group.
+func processGroupAlive(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(-cmd.Process.Pid, 0)
+	return !errors.Is(err, syscall.ESRCH)
 }
