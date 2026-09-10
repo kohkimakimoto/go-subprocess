@@ -72,7 +72,8 @@ type Config struct {
 	// RestartDelayMax caps the restart delay. The zero value is 30s.
 	RestartDelayMax time.Duration
 	// StopTimeout bounds waiting for the process group after StopSignal, and
-	// separately bounds draining output after shutdown or cancellation.
+	// separately bounds draining output after the child exits (including
+	// shutdown, cancellation, and normal exit).
 	// The zero value is 10s.
 	StopTimeout time.Duration
 	// StopSignal is sent on context cancellation. The zero value is os.Interrupt.
@@ -467,23 +468,21 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 		close(outputDone)
 	}()
 	// Descendants may still hold output pipes after the direct child exits.
-	// Bound the drain after shutdown/cancellation so Wait can return.
-	abandoned := false
+	// Always bound the drain so Wait can return.
+	var drainTimedOut bool
 	if shutdown {
-		abandoned = waitOutputDrain(outputDone, p.config.StopTimeout, stdoutR, stderrR)
+		drainTimedOut = waitOutputDrain(outputDone, p.config.StopTimeout, stdoutR, stderrR)
 	} else {
-		select {
-		case <-outputDone:
-		case <-ctx.Done():
+		drainTimedOut = waitOutputDrainAfterExit(ctx, p.config.StopTimeout, func() {
 			waitErr = p.shutdownGroup(ctx, cmd, nil, true, waitErr)
-			abandoned = waitOutputDrain(outputDone, p.config.StopTimeout, stdoutR, stderrR)
-		}
+		}, outputDone, stdoutR, stderrR)
 	}
 
 	var scanErr error
-	if abandoned {
-		// Destination Write may still be blocked; collect only ready pump errors.
-		scanErr = takeReadyErrors(errCh)
+	if drainTimedOut {
+		// Pumps may still be blocked in Write, or may have failed from the
+		// forced pipe close; those teardown errors are not surfaced.
+		_ = takeReadyErrors(errCh)
 	} else {
 		close(errCh)
 		for e := range errCh {
@@ -606,8 +605,8 @@ func waitForProcessGroup(cmd *exec.Cmd) {
 }
 
 // waitOutputDrain waits for output pumps to finish. On timeout it closes the
-// pipe read ends and, after a short grace period, returns whether the wait was
-// abandoned (pump likely blocked in a destination Write).
+// pipe read ends, waits briefly for pumps to exit, and returns true to indicate
+// the drain was cut short (caller should ignore pump teardown errors).
 func waitOutputDrain(done <-chan struct{}, timeout time.Duration, pipes ...*os.File) bool {
 	if timeout <= 0 {
 		timeout = defaultStopTimeout
@@ -619,17 +618,45 @@ func waitOutputDrain(done <-chan struct{}, timeout time.Duration, pipes ...*os.F
 	case <-done:
 		return false
 	case <-timer.C:
+		finishOutputDrain(done, pipes...)
+		return true
 	}
+}
 
+// waitOutputDrainAfterExit is like waitOutputDrain for a normal child exit.
+// If ctx is canceled first, onCancel runs (to shut down remaining group members)
+// and then draining continues with the same timeout bound.
+func waitOutputDrainAfterExit(ctx context.Context, timeout time.Duration, onCancel func(), done <-chan struct{}, pipes ...*os.File) bool {
+	if timeout <= 0 {
+		timeout = defaultStopTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return false
+	case <-ctx.Done():
+		if onCancel != nil {
+			onCancel()
+		}
+		return waitOutputDrain(done, timeout, pipes...)
+	case <-timer.C:
+		finishOutputDrain(done, pipes...)
+		return true
+	}
+}
+
+// finishOutputDrain closes pipe read ends and waits briefly for pumps to notice.
+// A pump blocked in destination Write may still outlive this wait.
+func finishOutputDrain(done <-chan struct{}, pipes ...*os.File) {
 	closeFiles(pipes...)
 
 	grace := time.NewTimer(outputDrainGrace)
 	defer grace.Stop()
 	select {
 	case <-done:
-		return false
 	case <-grace.C:
-		return true
 	}
 }
 

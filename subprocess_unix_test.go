@@ -203,7 +203,7 @@ func TestCancelWhileDrainingDescendantOutput(t *testing.T) {
 				Env:         helperEnv("parent-exit", pidFile),
 				Stdout:      os.Stdout,
 				Stderr:      os.Stderr,
-				StopTimeout: 50 * time.Millisecond,
+				StopTimeout: 500 * time.Millisecond, // cancel before drain timeout; short group kill after cancel
 			}
 			formatter := func(s string) string { return s }
 			if stream == "stdout" {
@@ -261,6 +261,50 @@ func TestCancelWhileDrainingDescendantOutput(t *testing.T) {
 	}
 }
 
+func TestOutputDrainTimeoutAfterChildExit(t *testing.T) {
+	for _, stream := range []string{"stdout", "stderr"} {
+		t.Run(stream, func(t *testing.T) {
+			pidFile := filepath.Join(t.TempDir(), "child.pid")
+			cfg := Config{
+				Command:     os.Args[0],
+				Env:         helperEnv("parent-exit", pidFile),
+				Stdout:      io.Discard,
+				Stderr:      io.Discard,
+				StopTimeout: 50 * time.Millisecond,
+			}
+			formatter := func(s string) string { return s }
+			if stream == "stdout" {
+				cfg.StdoutFormatter = formatter
+			} else {
+				cfg.StderrFormatter = formatter
+			}
+			p, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			childPID := waitForPIDFile(t, pidFile)
+			t.Cleanup(func() {
+				_ = syscall.Kill(childPID, syscall.SIGKILL)
+			})
+
+			started := time.Now()
+			if err := p.Wait(); err != nil {
+				t.Fatalf("Wait = %v, want nil after drain timeout", err)
+			}
+			if elapsed := time.Since(started); elapsed > 2*time.Second {
+				t.Fatalf("Wait took %s, want drain timeout near StopTimeout", elapsed)
+			}
+			// Normal exit does not reap remaining group members; only the drain is bounded.
+			if !processAlive(childPID) {
+				t.Fatalf("descendant %d was killed on drain timeout; want it left running", childPID)
+			}
+		})
+	}
+}
+
 type contextErrorWriter struct{ err error }
 
 func (w contextErrorWriter) Write([]byte) (int, error) { return 0, w.err }
@@ -278,7 +322,7 @@ func TestCancelAfterOutputWriterContextError(t *testing.T) {
 					Env:         helperEnv("parent-exit", pidFile),
 					Stdout:      io.Discard,
 					Stderr:      io.Discard,
-					StopTimeout: 50 * time.Millisecond,
+					StopTimeout: 500 * time.Millisecond, // cancel before drain timeout; short group kill after cancel
 				}
 				formatter := func(s string) string { return s }
 				if stream == "stdout" {
