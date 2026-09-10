@@ -1,5 +1,10 @@
 # go-subprocess
 
+
+[![test](https://github.com/kohkimakimoto/go-subprocess/actions/workflows/test.yml/badge.svg)](https://github.com/kohkimakimoto/go-subprocess/actions/workflows/test.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/kohkimakimoto/go-subprocess/blob/main/LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/kohkimakimoto/go-subprocess.svg)](https://pkg.go.dev/github.com/kohkimakimoto/go-subprocess)
+
 A Go library for implementing subprocess management within Go applications.
 
 ## Motivation
