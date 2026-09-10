@@ -467,8 +467,8 @@ func (w *overlapWriter) Write(b []byte) (int, error) {
 }
 
 func TestSharedWriterWithOneFormatter(t *testing.T) {
-	for _, stream := range []string{"stdout", "stderr"} {
-		t.Run(stream, func(t *testing.T) {
+	for _, mode := range []string{"stdout-formatter", "stderr-formatter", "raw"} {
+		t.Run(mode, func(t *testing.T) {
 			var output overlapWriter
 			cfg := Config{
 				Command: "sh",
@@ -477,9 +477,10 @@ func TestSharedWriterWithOneFormatter(t *testing.T) {
 				Stderr:  &output,
 			}
 			formatter := func(s string) string { return s }
-			if stream == "stdout" {
+			switch mode {
+			case "stdout-formatter":
 				cfg.StdoutFormatter = formatter
-			} else {
+			case "stderr-formatter":
 				cfg.StderrFormatter = formatter
 			}
 			if err := Run(cfg); err != nil {
@@ -513,44 +514,55 @@ func (w *blockingWriter) Write(b []byte) (int, error) {
 }
 
 func TestCancelWithBlockedOutputWriter(t *testing.T) {
-	w := &blockingWriter{
-		ready: make(chan struct{}),
-		block: make(chan struct{}),
-	}
-	defer close(w.block)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p, err := New(Config{
-		Command:         "sh",
-		Args:            []string{"-c", "echo hello; sleep 30"},
-		Stdout:          w,
-		Stderr:          io.Discard,
-		StdoutFormatter: func(s string) string { return s },
-		StopTimeout:     50 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := p.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-w.ready:
-	case <-time.After(2 * time.Second):
-		t.Fatal("writer was not called")
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- p.Wait() }()
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Wait = %v, want context.Canceled", err)
+	for _, withFormatter := range []bool{false, true} {
+		name := "raw"
+		if withFormatter {
+			name = "formatter"
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Wait blocked on output Writer after cancellation")
+		t.Run(name, func(t *testing.T) {
+			w := &blockingWriter{
+				ready: make(chan struct{}),
+				block: make(chan struct{}),
+			}
+			defer close(w.block)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cfg := Config{
+				Command:     "sh",
+				Args:        []string{"-c", "echo hello; sleep 30"},
+				Stdout:      w,
+				Stderr:      io.Discard,
+				StopTimeout: 50 * time.Millisecond,
+			}
+			if withFormatter {
+				cfg.StdoutFormatter = func(s string) string { return s }
+			}
+			p, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-w.ready:
+			case <-time.After(2 * time.Second):
+				t.Fatal("writer was not called")
+			}
+
+			done := make(chan error, 1)
+			go func() { done <- p.Wait() }()
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Wait = %v, want context.Canceled", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Wait blocked on output Writer after cancellation")
+			}
+		})
 	}
 }
 

@@ -73,7 +73,7 @@ type Config struct {
 	// RestartDelayMax caps the restart delay. The zero value is 30s.
 	RestartDelayMax time.Duration
 	// StopTimeout bounds waiting for the process group after StopSignal, and
-	// separately bounds draining formatted output after shutdown or cancellation.
+	// separately bounds draining output after shutdown or cancellation.
 	// The zero value is 10s.
 	StopTimeout time.Duration
 	// StopSignal is sent on context cancellation. The zero value is os.Interrupt.
@@ -394,22 +394,23 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 		cmd.Stdin = input.reader
 	}
 
-	// Formatter pipes are process-owned so scanners can keep reading after Wait.
+	// Own pipes for formatters and non-file Writers so cmd.Wait only waits on the
+	// child. Destination Write is drained (and may be abandoned) separately.
 	var stdoutR, stdoutW *os.File
 	var stderrR, stderrW *os.File
 	var err error
 
-	if p.config.StdoutFormatter != nil {
+	if ownOutputPipe(p.config.Stdout, p.config.StdoutFormatter) {
 		stdoutR, stdoutW, err = os.Pipe()
 		if err != nil {
 			return fmt.Errorf("subprocess: stdout pipe: %w", err)
 		}
 		cmd.Stdout = stdoutW
 	} else if p.config.Stdout != nil {
-		cmd.Stdout = outputWriter(p.config.Stdout)
+		cmd.Stdout = p.config.Stdout
 	}
 
-	if p.config.StderrFormatter != nil {
+	if ownOutputPipe(p.config.Stderr, p.config.StderrFormatter) {
 		stderrR, stderrW, err = os.Pipe()
 		if err != nil {
 			closeFiles(stdoutR, stdoutW)
@@ -417,7 +418,7 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 		}
 		cmd.Stderr = stderrW
 	} else if p.config.Stderr != nil {
-		cmd.Stderr = outputWriter(p.config.Stderr)
+		cmd.Stderr = p.config.Stderr
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -437,24 +438,26 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
-	if stdoutR != nil {
+	startOutputPump := func(r *os.File, dest io.Writer, formatter LogFormatter) {
+		if r == nil {
+			return
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if scanErr := scanLines(stdoutR, p.config.Stdout, p.config.StdoutFormatter); scanErr != nil {
-				errCh <- scanErr
+			var pumpErr error
+			if formatter != nil {
+				pumpErr = scanLines(r, dest, formatter)
+			} else {
+				pumpErr = copyOutput(r, dest)
+			}
+			if pumpErr != nil {
+				errCh <- pumpErr
 			}
 		}()
 	}
-	if stderrR != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if scanErr := scanLines(stderrR, p.config.Stderr, p.config.StderrFormatter); scanErr != nil {
-				errCh <- scanErr
-			}
-		}()
-	}
+	startOutputPump(stdoutR, p.config.Stdout, p.config.StdoutFormatter)
+	startOutputPump(stderrR, p.config.Stderr, p.config.StderrFormatter)
 
 	waitErr, shutdown := p.waitOrShutdown(ctx, cmd)
 	p.recordExit(cmd)
@@ -479,7 +482,7 @@ func (p *Process) runProcess(ctx context.Context, input *managedInput) error {
 
 	var scanErr error
 	if abandoned {
-		// Destination Write may still be blocked; collect only ready scan errors.
+		// Destination Write may still be blocked; collect only ready pump errors.
 		scanErr = takeReadyErrors(errCh)
 	} else {
 		close(errCh)
@@ -602,9 +605,9 @@ func waitForProcessGroup(cmd *exec.Cmd) {
 	}
 }
 
-// waitOutputDrain waits for formatted output scanners to finish. On timeout it
-// closes the pipe read ends and, after a short grace period, returns whether
-// the wait was abandoned (scanner likely blocked in a destination Write).
+// waitOutputDrain waits for output pumps to finish. On timeout it closes the
+// pipe read ends and, after a short grace period, returns whether the wait was
+// abandoned (pump likely blocked in a destination Write).
 func waitOutputDrain(done <-chan struct{}, timeout time.Duration, pipes ...*os.File) bool {
 	if timeout <= 0 {
 		timeout = defaultStopTimeout
@@ -690,12 +693,17 @@ func (w lockedWriter) Write(b []byte) (int, error) {
 	return w.dest.Write(b)
 }
 
-func outputWriter(dest io.Writer) io.Writer {
-	// *os.File keeps OS file semantics when connected directly to the child.
-	if _, ok := dest.(*os.File); ok {
-		return dest
+// ownOutputPipe reports whether dest should be read through a process-owned pipe.
+// *os.File destinations without a formatter stay connected directly to the child.
+func ownOutputPipe(dest io.Writer, formatter LogFormatter) bool {
+	if formatter != nil {
+		return true
 	}
-	return lockedWriter{dest: dest}
+	if dest == nil {
+		return false
+	}
+	_, isFile := dest.(*os.File)
+	return !isFile
 }
 
 // mutexForWriter returns the lock for dest's pointer identity.
@@ -743,6 +751,19 @@ func scanLines(src io.ReadCloser, dest io.Writer, formatter LogFormatter) error 
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("subprocess: scan output: %w", err)
+	}
+	return nil
+}
+
+func copyOutput(src io.ReadCloser, dest io.Writer) error {
+	defer src.Close()
+
+	if dest == nil {
+		dest = io.Discard
+	}
+	_, err := io.Copy(lockedWriter{dest: dest}, src)
+	if err != nil {
+		return fmt.Errorf("subprocess: copy output: %w", err)
 	}
 	return nil
 }

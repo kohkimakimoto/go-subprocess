@@ -80,12 +80,14 @@ Non-file readers are copied through a pipe shared across restarts.
 
 On Unix, the child runs in its own process group. Stop signals and the timeout kill go to that group, so descendants are included in shutdown.
 Shell background jobs often ignore `SIGINT` and `SIGTERM`; those descendants are reaped when `StopTimeout` elapses and the group is killed.
-`StopTimeout` also bounds how long formatted output is drained after shutdown or cancellation.
+`StopTimeout` also bounds how long output is drained after shutdown or cancellation.
+Non-file Writers are copied through process-owned pipes so `Wait` is not tied to a blocked `Write`; a blocked write may still outlive `Wait` after that bound.
 
 ### Format output
 
 With a formatter, output is scanned line by line.
-Without a formatter, stdout and stderr are connected directly so binary output is preserved.
+Without a formatter, `*os.File` destinations are connected directly (binary preserved);
+other Writers are copied through a pipe (also binary-preserving).
 
 ```go
 config := subprocess.Config{
