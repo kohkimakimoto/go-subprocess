@@ -39,7 +39,7 @@ const (
 // The line does not include the trailing newline.
 type LogFormatter func(line string) string
 
-// Config holds subprocess settings for New, Run, and RunWithContext.
+// Config holds subprocess settings for New and Start.
 // It is passed by value. Args and Env are deep-copied; Stdin, Stdout, Stderr,
 // and callbacks are shared references.
 type Config struct {
@@ -797,20 +797,15 @@ func writeLine(dest io.Writer, line string, mu *sync.Mutex) error {
 	return err
 }
 
-// Run executes a subprocess and waits for it to finish.
-// An empty RestartPolicy is RestartNever.
-func Run(config Config) error {
-	return RunWithContext(context.Background(), config)
-}
-
-// RunWithContext executes a subprocess with ctx and waits for it to finish.
-func RunWithContext(ctx context.Context, config Config) error {
+// Start creates a managed process and starts supervising it under ctx.
+// The caller must call Wait to wait for shutdown after canceling ctx.
+func Start(ctx context.Context, config Config) (*Process, error) {
 	process, err := New(config)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := process.Start(ctx); err != nil {
-		return err
+		return nil, err
 	}
-	return process.Wait()
+	return process, nil
 }

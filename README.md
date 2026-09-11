@@ -36,62 +36,7 @@ go get github.com/kohkimakimoto/go-subprocess
 
 ## Usage
 
-### Run once
-
-```go
-err := subprocess.Run(subprocess.Config{
-    Command: "echo",
-    Args:    []string{"hello"},
-})
-```
-
-### Supervise until the application context is canceled
-
-```go
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-
-err := subprocess.RunWithContext(ctx, subprocess.Config{
-    Command:         "npm",
-    Args:            []string{"run", "dev"},
-    RestartPolicy:   subprocess.RestartOnFail,
-    MaxRestarts:     5,                // restarts, not including the initial start
-    RestartDelay:    time.Second,     // delay before the first restart
-    RestartBackoff:  2,               // set 1 for a fixed delay
-    RestartDelayMax: 30 * time.Second,
-    StopTimeout:     10 * time.Second,
-    StopSignal:      os.Interrupt,
-    OnRestart: func(count int) {
-        log.Printf("restarted %d times", count)
-    },
-    OnError: func(err error) {
-        log.Printf("process error: %v", err)
-    },
-})
-if errors.Is(err, context.Canceled) {
-    // stopped because ctx was canceled, not because the child crashed
-}
-```
-
-`RunWithContext` blocks until the process stops permanently or `ctx` is canceled.
-It returns the last run's result. A successful restart after a failure returns nil.
-Context cancellation is wrapped so `errors.Is(err, context.Canceled)` and `errors.Is(err, context.DeadlineExceeded)` work.
-`OnError` is skipped for cancellation.
-`OnRestart` and `OnError` must not call `Wait`.
-
-The caller owns `Stdin` and closes it if needed.
-Non-file readers are copied through a pipe shared across restarts.
-`Wait` can return while an input `Read` is still pending; that read continues until the caller unblocks or closes the reader.
-
-On Unix, the child runs in its own process group. Stop signals and the timeout kill go to that group, so descendants are included in shutdown.
-Shell background jobs often ignore `SIGINT` and `SIGTERM`; those descendants are reaped when `StopTimeout` elapses and the group is killed.
-`StopTimeout` also bounds how long output is drained after shutdown or cancellation.
-Non-file Writers are copied through process-owned pipes so `Wait` is not tied to a blocked `Write`; a blocked write may still outlive `Wait` after that bound.
-
-### Run a subprocess alongside an HTTP server
-
-A typical use case: a Go HTTP server manages an auxiliary process such as `npm run dev`.
-Both share one context so the child stops when the application shuts down.
+Start a subprocess under a shared cancelable context, then call `Wait` on shutdown.
 
 ```go
 package main
@@ -110,26 +55,23 @@ import (
 )
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// One context owns app lifetime (signals + shared cancel).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	dev, err := subprocess.New(subprocess.Config{
+	// Start returns once supervision has begun; the child stops when ctx is canceled.
+	p, err := subprocess.Start(ctx, subprocess.Config{
 		Command:       "npm",
 		Args:          []string{"run", "dev"},
 		RestartPolicy: subprocess.RestartOnFail,
-		StopTimeout:   10 * time.Second,
+		StopTimeout:   10 * time.Second, // StopSignal, then group kill on Unix
 		StopSignal:    os.Interrupt,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := dev.Start(ctx); err != nil {
-		log.Fatal(err)
-	}
 
-	devDone := make(chan error, 1)
-	go func() { devDone <- dev.Wait() }()
-
+	// Your main http server.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -140,43 +82,45 @@ func main() {
 		log.Printf("http listening on %s", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("http error: %v", err)
-			cancel()
+			stop()
 		}
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	<-sigCh
+	<-ctx.Done()
 	log.Print("shutting down")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("http shutdown: %v", err)
 	}
 
-	cancel()
-	if err := <-devDone; err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("npm: %v", err)
+	// Always Wait so graceful/group stop can finish.
+	if err := p.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("subprocess: %v", err)
 	}
 }
 ```
 
-### Format output
+## Format output
 
 With a formatter, output is scanned line by line.
 Without a formatter, `*os.File` destinations are connected directly (binary preserved);
 other Writers are copied through a pipe (also binary-preserving).
 
 ```go
-err := subprocess.Run(subprocess.Config{
-    Command: "echo",
-    Args:    []string{"test message"},
-    StdoutFormatter: subprocess.ChainFormatters(
-        subprocess.TimestampFormatter(time.RFC3339),
-        subprocess.PrefixFormatter("[app] "),
-    ),
+p, err := subprocess.Start(context.Background(), subprocess.Config{
+	Command: "echo",
+	Args:    []string{"test message"},
+	StdoutFormatter: subprocess.ChainFormatters(
+		subprocess.TimestampFormatter(time.RFC3339),
+		subprocess.PrefixFormatter("[app] "),
+	),
 })
+if err != nil {
+	log.Fatal(err)
+}
+_ = p.Wait()
 ```
 
 Example output:

@@ -51,7 +51,12 @@ func TestExitWithBlockedStdin(t *testing.T) {
 	defer w.Close()
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(Config{Command: "sh", Args: []string{"-c", "exit 0"}, Stdin: r, Stdout: io.Discard, Stderr: io.Discard})
+		p, err := Start(context.Background(), Config{Command: "sh", Args: []string{"-c", "exit 0"}, Stdin: r, Stdout: io.Discard, Stderr: io.Discard})
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- p.Wait()
 	}()
 	select {
 	case err := <-done:
@@ -66,8 +71,11 @@ func TestExitWithBlockedStdin(t *testing.T) {
 func TestStdinTransfer(t *testing.T) {
 	input := bytes.Repeat([]byte{'a', 0, 'b', '\n'}, 32768)
 	var output bytes.Buffer
-	err := Run(Config{Command: "cat", Stdin: bytes.NewReader(input), Stdout: &output, Stderr: io.Discard})
+	p, err := Start(context.Background(), Config{Command: "cat", Stdin: bytes.NewReader(input), Stdout: &output, Stderr: io.Discard})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Wait(); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(output.Bytes(), input) {
@@ -81,9 +89,12 @@ func (r failingInput) Read([]byte) (int, error) { return 0, r.err }
 
 func TestStdinError(t *testing.T) {
 	want := errors.New("input failed")
-	err := Run(Config{Command: "cat", Stdin: failingInput{want}, Stdout: io.Discard, Stderr: io.Discard})
-	if !errors.Is(err, want) {
-		t.Fatalf("Run = %v, want %v", err, want)
+	p, err := Start(context.Background(), Config{Command: "cat", Stdin: failingInput{want}, Stdout: io.Discard, Stderr: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Wait(); !errors.Is(err, want) {
+		t.Fatalf("Wait = %v, want %v", err, want)
 	}
 }
 
@@ -141,8 +152,11 @@ func (r *observedInput) Read([]byte) (int, error) {
 
 func TestStartFailureDoesNotReadStdin(t *testing.T) {
 	r := &observedInput{}
-	err := Run(Config{Command: filepath.Join(t.TempDir(), "missing"), Stdin: r})
-	if err == nil {
+	p, err := Start(context.Background(), Config{Command: filepath.Join(t.TempDir(), "missing"), Stdin: r})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Wait(); err == nil {
 		t.Fatal("expected start failure")
 	}
 	if got := atomic.LoadInt32(&r.reads); got != 0 {

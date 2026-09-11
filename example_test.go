@@ -10,14 +10,18 @@ import (
 	"github.com/kohkimakimoto/go-subprocess"
 )
 
-func ExampleRun() {
+func ExampleStart() {
 	config := subprocess.Config{
 		Command: "echo",
 		Args:    []string{"Hello, World!"},
 	}
 
-	err := subprocess.Run(config)
+	p, err := subprocess.Start(context.Background(), config)
 	if err != nil {
+		fmt.Printf("Failed to start: %v\n", err)
+		return
+	}
+	if err := p.Wait(); err != nil {
 		fmt.Printf("Command failed: %v\n", err)
 	}
 	// Output: Hello, World!
@@ -32,7 +36,12 @@ func ExampleConfig_stdoutFormatter() {
 		},
 	}
 
-	subprocess.Run(config)
+	p, err := subprocess.Start(context.Background(), config)
+	if err != nil {
+		fmt.Printf("Failed to start: %v\n", err)
+		return
+	}
+	_ = p.Wait()
 	// Output: [STDOUT] TEST MESSAGE
 }
 
@@ -47,16 +56,12 @@ func ExampleProcess_timeout() {
 		Stderr:  io.Discard,
 	}
 
-	process, err := subprocess.New(config)
+	p, err := subprocess.Start(ctx, config)
 	if err != nil {
-		fmt.Printf("Failed to create process: %v\n", err)
-		return
-	}
-	if err := process.Start(ctx); err != nil {
 		fmt.Printf("Failed to start process: %v\n", err)
 		return
 	}
-	err = process.Wait()
+	err = p.Wait()
 
 	if err != nil {
 		fmt.Println("Process terminated by timeout")

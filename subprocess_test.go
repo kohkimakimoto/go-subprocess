@@ -21,6 +21,62 @@ func TestNewValidation(t *testing.T) {
 	}
 }
 
+func mustStart(t *testing.T, ctx context.Context, cfg Config) *Process {
+	t.Helper()
+	p, err := Start(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func startWait(t *testing.T, cfg Config) error {
+	t.Helper()
+	return mustStart(t, context.Background(), cfg).Wait()
+}
+
+func TestStart(t *testing.T) {
+	var buf bytes.Buffer
+	p := mustStart(t, context.Background(), Config{
+		Command: "echo",
+		Args:    []string{"hello"},
+		Stdout:  &buf,
+		Stderr:  io.Discard,
+	})
+	if err := p.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); got != "hello\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestStartCancelStopsProcess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := mustStart(t, ctx, Config{
+		Command:     "sleep",
+		Args:        []string{"30"},
+		Stdout:      io.Discard,
+		Stderr:      io.Discard,
+		StopTimeout: 50 * time.Millisecond,
+	})
+	waitUntilRunning(t, p)
+	done := make(chan error, 1)
+	go func() { done <- p.Wait() }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Wait = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after cancel")
+	}
+	if p.Running() {
+		t.Fatal("process still running")
+	}
+}
+
 func TestNewDoesNotMutateConfig(t *testing.T) {
 	cfg := Config{Command: "echo", Args: []string{"hi"}}
 	if _, err := New(cfg); err != nil {
@@ -34,9 +90,9 @@ func TestNewDoesNotMutateConfig(t *testing.T) {
 	}
 }
 
-func TestRunEcho(t *testing.T) {
+func TestStartEcho(t *testing.T) {
 	var buf bytes.Buffer
-	err := Run(Config{
+	err := startWait(t, Config{
 		Command: "echo",
 		Args:    []string{"hello"},
 		Stdout:  &buf,
@@ -68,7 +124,7 @@ func TestEmptyEnvIsNotInherited(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	err = Run(Config{
+	err = startWait(t, Config{
 		Command: "sh",
 		Args:    []string{"-c", "printf %s \"$" + key + "\""},
 		Env:     []string{},
@@ -88,7 +144,7 @@ func TestNilEnvInherits(t *testing.T) {
 	t.Setenv(key, "inherited")
 
 	var buf bytes.Buffer
-	err := Run(Config{
+	err := startWait(t, Config{
 		Command: "sh",
 		Args:    []string{"-c", "printf %s \"$" + key + "\""},
 		Stdout:  &buf,
@@ -147,7 +203,7 @@ func TestSlowFormatterKeepsSuccessfulOutput(t *testing.T) {
 
 func TestFormatterAndLongLine(t *testing.T) {
 	var buf bytes.Buffer
-	err := Run(Config{
+	err := startWait(t, Config{
 		Command: "echo",
 		Args:    []string{"hello"},
 		Stdout:  &buf,
@@ -165,7 +221,7 @@ func TestFormatterAndLongLine(t *testing.T) {
 
 	line := strings.Repeat("a", 70*1024)
 	buf.Reset()
-	err = Run(Config{
+	err = startWait(t, Config{
 		Command: "sh",
 		Args:    []string{"-c", "printf '%s\n' \"$1\"", "sh", line},
 		Stdout:  &buf,
@@ -483,7 +539,7 @@ func TestSharedWriterWithOneFormatter(t *testing.T) {
 			case "stderr-formatter":
 				cfg.StderrFormatter = formatter
 			}
-			if err := Run(cfg); err != nil {
+			if err := startWait(t, cfg); err != nil {
 				t.Fatal(err)
 			}
 			if output.overlapped.Load() {
@@ -506,7 +562,7 @@ func (w valueSharedWriter) Write(b []byte) (int, error) { return w.w.Write(b) }
 func TestSharedValueWriterStdoutStderr(t *testing.T) {
 	var output overlapWriter
 	shared := valueSharedWriter{w: &output}
-	err := Run(Config{
+	err := startWait(t, Config{
 		Command:         "sh",
 		Args:            []string{"-c", `i=0; while [ "$i" -lt 100 ]; do echo out; echo err >&2; i=$((i+1)); done`},
 		Stdout:          shared,
@@ -626,13 +682,18 @@ func TestDistinctWritersDoNotShareLock(t *testing.T) {
 	var fast bytes.Buffer
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(Config{
+		p, err := Start(context.Background(), Config{
 			Command:         "echo",
 			Args:            []string{"fast"},
 			Stdout:          &fast,
 			Stderr:          io.Discard,
 			StdoutFormatter: func(s string) string { return s },
 		})
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- p.Wait()
 	}()
 	select {
 	case err := <-done:
